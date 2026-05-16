@@ -187,7 +187,7 @@ chmod +x install-claw.sh
 ./install-claw.sh                  # default install
 ./install-claw.sh --dir /opt/claw  # custom path
 ./install-claw.sh --skip-deps      # if you already have git/cc/make/rustup
-./install-claw.sh --no-rc          # don't touch ~/.bashrc / ~/.zshrc
+./install-claw.sh --no-rc          # don't touch ~/.profile / ~/.zshrc / fish config
 ```
 
 What it does: detects the package manager (`apt-get` / `dnf` / `yum` /
@@ -195,8 +195,19 @@ What it does: detects the package manager (`apt-get` / `dnf` / `yum` /
 `rustup` (minimal stable profile) if `cargo` is missing, clones this fork,
 runs `cargo build --release -p rusty-claude-cli`, symlinks
 `~/.local/bin/claw`, optionally injects an idempotent block into your
-shell rc (`~/.bashrc` / `~/.zshrc` / fish), and prints a WSL-specific proxy
+shell's login-shell rc (`~/.profile` for bash, `~/.zshrc` for zsh,
+`~/.config/fish/config.fish` for fish), and prints a WSL-specific proxy
 hint only when WSL is detected (`/proc/version` containing `microsoft`).
+
+> ⚠️ **Why `~/.profile` for bash and not `~/.bashrc`?** Debian/Ubuntu's
+> default `~/.bashrc` starts with `case $- in *i*) ;; *) return;; esac`,
+> which causes **non-interactive login shells** (e.g. `bash -lc 'claw ...'`
+> invoked by VS Code tasks, CI runners, or cron) to skip everything after
+> that line. Putting env vars in `~/.profile` (which is sourced by every
+> login shell, interactive or not, and which itself sources `~/.bashrc`
+> when interactive) makes the credentials reliably available in every
+> context. If `claw` fails with `missing OpenAI credentials` only inside a
+> VS Code task while it works in your terminal, this is the root cause.
 
 ---
 

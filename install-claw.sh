@@ -55,11 +55,11 @@ install-claw.sh — Cross-distro installer for Claw-Code DeepSeek default proxy
 Options:
   --dir PATH       Install dir (default: $DEFAULT_DIR)
   --skip-deps      Don't install system packages (assume already present)
-  --no-rc          Don't modify ~/.bashrc / ~/.zshrc
+  --no-rc          Don't modify ~/.profile / ~/.zshrc / fish config
   -h, --help       Show this help
 
 After install:
-  source ~/.bashrc      # or zshrc / your shell's rc
+  source ~/.profile     # or .zshrc / restart shell (or open a new terminal)
   claw --help
   claw subagent batch --help
 EOF
@@ -215,14 +215,21 @@ inject_rc() {
         return
     fi
 
-    # Pick rc file based on $SHELL
+    # Pick rc file based on $SHELL.
+    #
+    # IMPORTANT: bash's default ~/.bashrc starts with `case $- in *i*) ;; *) return;; esac`
+    # which causes non-interactive login shells (e.g. `bash -lc 'claw ...'` invoked by
+    # CI / VS Code tasks / cron) to skip the export block entirely. So for bash we write
+    # to ~/.profile, which is *always* sourced by login shells regardless of interactivity.
+    # (Debian/Ubuntu's default ~/.profile already sources ~/.bashrc when interactive, so
+    # both modes pick the env up.)
     case "${SHELL:-}" in
         */zsh) RC="$HOME/.zshrc" ;;
         */fish)
             RC="$HOME/.config/fish/config.fish"
             mkdir -p "$(dirname "$RC")"
             ;;
-        *) RC="$HOME/.bashrc" ;;
+        *) RC="$HOME/.profile" ;;
     esac
 
     MARK_BEGIN="# >>> claw-code installer >>>"
@@ -250,6 +257,8 @@ inject_rc() {
         *)
             {
                 printf '\n%s\n' "$MARK_BEGIN"
+                printf '# Loaded by login shells (incl. non-interactive `bash -lc`),\n'
+                printf '# so VS Code / CI tasks reliably see these vars.\n'
                 printf 'export PATH="$HOME/.local/bin:$PATH"\n'
                 printf '[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"\n'
                 printf '# DeepSeek default proxy (uncomment + fill in)\n'
@@ -318,7 +327,7 @@ cat <<EOF
 
 ${C_G}=== All done ===${C_0}
 Next steps:
-  1. Re-source your shell rc:    . "\$HOME/.bashrc"   (or .zshrc / restart shell)
+  1. Re-source your shell rc:    . "\$HOME/.profile"   (or .zshrc / restart shell)
   2. Set your DeepSeek key:      export OPENAI_API_KEY=sk-...
                                   export OPENAI_BASE_URL=https://api.deepseek.com/v1
                                   export ANTHROPIC_MODEL=openai/deepseek-chat
