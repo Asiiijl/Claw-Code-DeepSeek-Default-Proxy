@@ -17,7 +17,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -345,6 +345,9 @@ fn parse_subagent_batch_args(
     let mut file_path: Option<String> = None;
     let mut from_stdin = false;
     let mut positional: Vec<String> = Vec::new();
+    let mut timeout_secs: Option<u64> = None;
+    let mut retries: u32 = 0;
+    let mut report_file: Option<PathBuf> = None;
     let mut i = 0;
     while i < rest.len() {
         match rest[i] {
@@ -370,26 +373,73 @@ fn parse_subagent_batch_args(
                 file_path = Some((*v).to_string());
                 i += 2;
             }
+            "--timeout" | "-t" => {
+                let v = rest
+                    .get(i + 1)
+                    .ok_or_else(|| "--timeout requires a number of seconds".to_string())?;
+                let secs = v
+                    .parse::<u64>()
+                    .map_err(|_| format!("invalid --timeout value: '{v}'"))?;
+                if secs == 0 {
+                    return Err("--timeout must be >= 1 second".to_string());
+                }
+                if secs > 86_400 {
+                    return Err("--timeout must be <= 86400 (24h safety cap)".to_string());
+                }
+                timeout_secs = Some(secs);
+                i += 2;
+            }
+            "--retries" | "-r" => {
+                let v = rest
+                    .get(i + 1)
+                    .ok_or_else(|| "--retries requires a number".to_string())?;
+                retries = v
+                    .parse::<u32>()
+                    .map_err(|_| format!("invalid --retries value: '{v}'"))?;
+                if retries > 10 {
+                    return Err("--retries must be <= 10".to_string());
+                }
+                i += 2;
+            }
+            "--report-file" | "-R" => {
+                let v = rest
+                    .get(i + 1)
+                    .ok_or_else(|| "--report-file requires a path".to_string())?;
+                report_file = Some(PathBuf::from(*v));
+                i += 2;
+            }
             "-" => {
                 from_stdin = true;
                 i += 1;
             }
             "--help" | "-h" => {
                 return Err(
-                    "usage: claw subagent batch [--parallel N] (--file PATH | - | TASK...)\n\
+                    "usage: claw subagent batch [OPTIONS] (--file PATH | - | TASK...)\n\
                      \n\
                      Dispatch multiple `subagent spawn` invocations in parallel.\n\
                      Each non-empty, non-`#` line of the input becomes one task.\n\
                      \n\
-                     Options:\n  \
-                       -p, --parallel N   Max concurrent agents (default 4, max 32)\n  \
-                       -f, --file PATH    Read tasks from a file (one per line)\n  \
-                       -                  Read tasks from stdin\n\
+                     Concurrency & isolation:\n  \
+                       -p, --parallel N        Max concurrent agents (default 4, max 32)\n  \
+                       -t, --timeout SECS      Per-task wall-clock timeout (kill on exceed)\n  \
+                       -r, --retries N         Retry failed tasks N times (default 0, max 10)\n  \
+                       -R, --report-file PATH  Atomically write JSON report to PATH on exit\n\
+                     \n\
+                     Task sources (pick one):\n  \
+                       -f, --file PATH         Read tasks from a file (one per line)\n  \
+                       -                       Read tasks from stdin\n  \
+                       TASK...                 One or more positional task strings\n\
                      \n\
                      Examples:\n  \
-                       claw subagent batch -p 3 -f tasks.txt\n  \
-                       printf 'task A\\ntask B\\n' | claw subagent batch -\n  \
-                       claw subagent batch 'task one' 'task two' 'task three'"
+                       claw subagent batch -p 3 -t 120 -r 2 -f tasks.txt\n  \
+                       claw subagent batch -R /tmp/report.json -p 4 'task A' 'task B'\n  \
+                       printf 'task A\\ntask B\\n' | claw subagent batch -\n\
+                     \n\
+                     Report-back pattern:\n  \
+                       Use --report-file to enable non-blocking parent agents:\n  \
+                       the parent dispatches `claw subagent batch ... -R out.json &`\n  \
+                       then polls `out.json` for existence instead of tailing the\n  \
+                       child's terminal (which would block its event loop)."
                         .to_string(),
                 );
             }
@@ -442,13 +492,16 @@ fn parse_subagent_batch_args(
         parallel,
         model,
         output_format,
+        timeout_secs,
+        retries,
+        report_file,
     })
 }
 
 /// Execute the subagent batch by re-invoking the current binary with
 /// `subagent spawn <task>` for each task, with at most `parallel` running
-/// concurrently. Each task's combined stdout/stderr is captured and printed
-/// with a `[i/N] task: ...` banner so output stays attributable.
+/// concurrently. Supports per-task timeout, retries, and atomic JSON report
+/// writing for the "subagent reports back" non-blocking pattern.
 ///
 /// Returns the exit code to propagate (0 if all succeeded, 1 if any failed).
 fn subagent_batch_run(
@@ -456,6 +509,9 @@ fn subagent_batch_run(
     parallel: usize,
     model: &str,
     output_format: CliOutputFormat,
+    timeout_secs: Option<u64>,
+    retries: u32,
+    report_file: Option<&Path>,
 ) -> std::io::Result<i32> {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -465,6 +521,7 @@ fn subagent_batch_run(
     let tasks_shared: Arc<Vec<String>> = Arc::new(tasks.to_vec());
     let model_shared = Arc::new(model.to_string());
     let format_json = matches!(output_format, CliOutputFormat::Json);
+    let timeout = timeout_secs.map(Duration::from_secs);
 
     #[derive(Clone)]
     struct TaskResult {
@@ -474,6 +531,74 @@ fn subagent_batch_run(
         stdout: String,
         stderr: String,
         duration_ms: u128,
+        attempts: u32,
+        timed_out: bool,
+    }
+
+    /// Run a single subagent invocation once, with optional wall-clock timeout.
+    /// On timeout we kill the child and synthesize an exit_code of 124 (the
+    /// conventional `timeout(1)` exit code) so callers can distinguish from
+    /// model-level failures.
+    fn run_once(
+        exe: &Path,
+        model: &str,
+        task: &str,
+        timeout: Option<Duration>,
+    ) -> (i32, String, String, bool) {
+        let mut cmd = Command::new(exe);
+        cmd.arg("--model")
+            .arg(model)
+            .arg("subagent")
+            .arg("spawn")
+            .arg(task)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                return (
+                    -1,
+                    String::new(),
+                    format!("failed to spawn child: {e}"),
+                    false,
+                )
+            }
+        };
+        let start = Instant::now();
+        let mut timed_out = false;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {
+                    if let Some(t) = timeout {
+                        if start.elapsed() >= t {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            timed_out = true;
+                            break;
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+                Err(_) => break,
+            }
+        }
+        match child.wait_with_output() {
+            Ok(o) => {
+                let code = if timed_out {
+                    124
+                } else {
+                    o.status.code().unwrap_or(-1)
+                };
+                (
+                    code,
+                    String::from_utf8_lossy(&o.stdout).into_owned(),
+                    String::from_utf8_lossy(&o.stderr).into_owned(),
+                    timed_out,
+                )
+            }
+            Err(e) => (-1, String::new(), format!("wait failed: {e}"), timed_out),
+        }
     }
 
     let results: Arc<Mutex<Vec<TaskResult>>> = Arc::new(Mutex::new(Vec::with_capacity(total)));
@@ -486,6 +611,8 @@ fn subagent_batch_run(
         let tasks_shared = Arc::clone(&tasks_shared);
         let model_shared = Arc::clone(&model_shared);
         let results = Arc::clone(&results);
+        let timeout_local = timeout;
+        let retries_local = retries;
         handles.push(thread::spawn(move || loop {
             let idx = next.fetch_add(1, Ordering::SeqCst);
             if idx >= tasks_shared.len() {
@@ -493,30 +620,28 @@ fn subagent_batch_run(
             }
             let task = tasks_shared[idx].clone();
             let start = Instant::now();
-            let out = Command::new(&exe)
-                .arg("--model")
-                .arg(&*model_shared)
-                .arg("subagent")
-                .arg("spawn")
-                .arg(&task)
-                .output();
-            let res = match out {
-                Ok(o) => TaskResult {
-                    index: idx,
-                    task: task.clone(),
-                    exit_code: o.status.code().unwrap_or(-1),
-                    stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
-                    stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
-                    duration_ms: start.elapsed().as_millis(),
-                },
-                Err(e) => TaskResult {
-                    index: idx,
-                    task: task.clone(),
-                    exit_code: -1,
-                    stdout: String::new(),
-                    stderr: format!("failed to spawn child: {e}"),
-                    duration_ms: start.elapsed().as_millis(),
-                },
+            let max_attempts = retries_local.saturating_add(1);
+            let mut attempts = 0u32;
+            let mut last = (-1i32, String::new(), String::from("no attempts ran"), false);
+            while attempts < max_attempts {
+                attempts += 1;
+                last = run_once(&exe, &model_shared, &task, timeout_local);
+                // Stop early on success, or on a timeout where retrying would
+                // just burn the same budget. The user can opt back into retry-
+                // on-timeout in a future flag if needed.
+                if last.0 == 0 || last.3 {
+                    break;
+                }
+            }
+            let res = TaskResult {
+                index: idx,
+                task: task.clone(),
+                exit_code: last.0,
+                stdout: last.1,
+                stderr: last.2,
+                duration_ms: start.elapsed().as_millis(),
+                attempts,
+                timed_out: last.3,
             };
             if let Ok(mut g) = results.lock() {
                 g.push(res);
@@ -534,53 +659,95 @@ fn subagent_batch_run(
     collected.sort_by_key(|r| r.index);
 
     let mut failed = 0usize;
-    if format_json {
-        let arr: Vec<serde_json::Value> = collected
-            .iter()
-            .map(|r| {
-                if r.exit_code != 0 {
-                    failed += 1;
-                }
-                serde_json::json!({
-                    "index":       r.index,
-                    "task":        r.task,
-                    "exit_code":   r.exit_code,
-                    "duration_ms": r.duration_ms,
-                    "stdout":      r.stdout,
-                    "stderr":      r.stderr,
-                })
+    let mut timed_out_count = 0usize;
+    for r in &collected {
+        if r.exit_code != 0 {
+            failed += 1;
+        }
+        if r.timed_out {
+            timed_out_count += 1;
+        }
+    }
+
+    // Build the JSON payload up-front: it is shared between --output-format json
+    // (printed to stdout) and --report-file (atomically written to disk so a
+    // parent agent can poll for completion without tailing the child terminal).
+    let arr: Vec<serde_json::Value> = collected
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "index":       r.index,
+                "task":        r.task,
+                "exit_code":   r.exit_code,
+                "duration_ms": r.duration_ms,
+                "attempts":    r.attempts,
+                "timed_out":   r.timed_out,
+                "stdout":      r.stdout,
+                "stderr":      r.stderr,
             })
-            .collect();
-        let report = serde_json::json!({
-            "batch":  {
-                "total":    total,
-                "parallel": workers,
-                "model":    &*model_shared,
-                "failed":   failed,
-            },
-            "results": arr,
-        });
+        })
+        .collect();
+    let started_at = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let report = serde_json::json!({
+        "batch":  {
+            "total":        total,
+            "parallel":     workers,
+            "model":        &*model_shared,
+            "failed":       failed,
+            "timed_out":    timed_out_count,
+            "timeout_secs": timeout_secs,
+            "retries":      retries,
+            "completed_at": started_at,
+        },
+        "results": arr,
+    });
+
+    if let Some(path) = report_file {
+        let tmp = path.with_extension("json.tmp");
+        let body = serde_json::to_string_pretty(&report).unwrap_or_default();
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, path)?;
+    }
+
+    if format_json {
         println!(
             "{}",
             serde_json::to_string_pretty(&report).unwrap_or_default()
         );
     } else {
         println!(
-            "▶ Claw subagent batch: total={total} parallel={workers} model={model}",
-            model = &*model_shared
+            "▶ Claw subagent batch: total={total} parallel={workers} model={model}{timeout_note}{retry_note}",
+            model = &*model_shared,
+            timeout_note = match timeout_secs {
+                Some(s) => format!(" timeout={s}s"),
+                None => String::new(),
+            },
+            retry_note = if retries > 0 { format!(" retries={retries}") } else { String::new() },
         );
         println!();
         for r in &collected {
-            let status = if r.exit_code == 0 { "OK" } else { "FAIL" };
-            if r.exit_code != 0 {
-                failed += 1;
-            }
+            let status = if r.exit_code == 0 {
+                "OK"
+            } else if r.timed_out {
+                "TIMEOUT"
+            } else {
+                "FAIL"
+            };
+            let attempts_note = if r.attempts > 1 {
+                format!(" attempts={}", r.attempts)
+            } else {
+                String::new()
+            };
             println!(
-                "[{i}/{n}] {status} ({ms} ms) :: {task}",
+                "[{i}/{n}] {status} ({ms} ms{attempts}) :: {task}",
                 i = r.index + 1,
                 n = total,
                 ms = r.duration_ms,
                 status = status,
+                attempts = attempts_note,
                 task = r.task,
             );
             if !r.stdout.trim().is_empty() {
@@ -595,7 +762,18 @@ fn subagent_batch_run(
             }
             println!();
         }
-        println!("◀ Done: {ok} ok, {failed} failed", ok = total - failed);
+        println!(
+            "◀ Done: {ok} ok, {failed} failed{to}",
+            ok = total - failed,
+            to = if timed_out_count > 0 {
+                format!(" ({timed_out_count} timed out)")
+            } else {
+                String::new()
+            },
+        );
+        if let Some(path) = report_file {
+            println!("  Report: {}", path.display());
+        }
     }
 
     Ok(if failed == 0 { 0 } else { 1 })
@@ -863,8 +1041,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             parallel,
             model,
             output_format,
+            timeout_secs,
+            retries,
+            report_file,
         } => {
-            let code = subagent_batch_run(&tasks, parallel, &model, output_format)?;
+            let code = subagent_batch_run(
+                &tasks,
+                parallel,
+                &model,
+                output_format,
+                timeout_secs,
+                retries,
+                report_file.as_deref(),
+            )?;
             if code != 0 {
                 std::process::exit(code);
             }
@@ -988,6 +1177,15 @@ enum CliAction {
         parallel: usize,
         model: String,
         output_format: CliOutputFormat,
+        /// Per-task wall-clock timeout in seconds. `None` = no timeout.
+        timeout_secs: Option<u64>,
+        /// Number of retries on non-zero exit (in addition to the first try).
+        retries: u32,
+        /// Optional path to atomically write the final JSON report.
+        /// Enables the "subagent reports back, main agent never tails the
+        /// terminal" non-blocking pattern: the parent process can poll this
+        /// file's existence / content instead of streaming child stdout.
+        report_file: Option<PathBuf>,
     },
 }
 
@@ -15561,5 +15759,104 @@ mod subagent_batch_tests {
             CliAction::SubagentBatch { parallel, .. } => assert_eq!(parallel, 7),
             other => panic!("expected SubagentBatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn batch_defaults_have_no_timeout_no_retries_no_report() {
+        let action = parse(&["task A"]).unwrap();
+        match action {
+            CliAction::SubagentBatch {
+                timeout_secs,
+                retries,
+                report_file,
+                ..
+            } => {
+                assert_eq!(timeout_secs, None);
+                assert_eq!(retries, 0);
+                assert_eq!(report_file, None);
+            }
+            other => panic!("expected SubagentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batch_accepts_timeout_and_retries_and_report_file() {
+        let action = parse(&[
+            "--timeout",
+            "60",
+            "--retries",
+            "2",
+            "--report-file",
+            "/tmp/x.json",
+            "task A",
+        ])
+        .unwrap();
+        match action {
+            CliAction::SubagentBatch {
+                timeout_secs,
+                retries,
+                report_file,
+                ..
+            } => {
+                assert_eq!(timeout_secs, Some(60));
+                assert_eq!(retries, 2);
+                assert_eq!(
+                    report_file.as_deref().and_then(|p| p.to_str()),
+                    Some("/tmp/x.json")
+                );
+            }
+            other => panic!("expected SubagentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batch_short_flags_for_new_options() {
+        let action = parse(&["-t", "30", "-r", "1", "-R", "/tmp/r.json", "task A"]).unwrap();
+        match action {
+            CliAction::SubagentBatch {
+                timeout_secs,
+                retries,
+                report_file,
+                ..
+            } => {
+                assert_eq!(timeout_secs, Some(30));
+                assert_eq!(retries, 1);
+                assert!(report_file.is_some());
+            }
+            other => panic!("expected SubagentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batch_rejects_timeout_zero() {
+        let err = parse(&["--timeout", "0", "task"]).unwrap_err();
+        assert!(err.contains(">= 1"), "got: {err}");
+    }
+
+    #[test]
+    fn batch_rejects_timeout_over_cap() {
+        let err = parse(&["--timeout", "86401", "task"]).unwrap_err();
+        assert!(err.contains("86400"), "got: {err}");
+    }
+
+    #[test]
+    fn batch_rejects_retries_over_cap() {
+        let err = parse(&["--retries", "11", "task"]).unwrap_err();
+        assert!(err.contains("<= 10"), "got: {err}");
+    }
+
+    #[test]
+    fn batch_rejects_non_numeric_timeout() {
+        let err = parse(&["--timeout", "abc", "task"]).unwrap_err();
+        assert!(err.contains("invalid --timeout"), "got: {err}");
+    }
+
+    #[test]
+    fn batch_help_mentions_new_flags() {
+        let err = parse(&["--help"]).unwrap_err();
+        assert!(err.contains("--timeout"), "got: {err}");
+        assert!(err.contains("--retries"), "got: {err}");
+        assert!(err.contains("--report-file"), "got: {err}");
+        assert!(err.contains("Report-back pattern"), "got: {err}");
     }
 }

@@ -141,6 +141,63 @@ Each task's stdout/stderr/exit_code/duration is captured and printed under a
 banner like `[2/5] OK (842 ms) :: <task>`. The overall command exits non-zero
 if any task failed, so it composes cleanly with `&&` / CI pipelines.
 
+#### 6.1 Non-blocking report-back pattern (new)
+
+A **main agent** that tails a child terminal can easily get stuck when the
+child stays attached to a streaming UI. To avoid that, `subagent batch` now
+supports three orthogonal flags:
+
+| Flag | Short | Effect |
+|------|-------|--------|
+| `--timeout SECS` | `-t` | Per-task wall-clock timeout; the worker `kill()`s the child and records `exit_code=124`, `timed_out=true`. Max 86400s. |
+| `--retries N`    | `-r` | Retry failed tasks up to N times (default 0, max 10). Timeouts are **not** retried by design. |
+| `--report-file PATH` | `-R` | Atomically write the full JSON report to `PATH` on exit (writes `PATH.tmp` then `rename`). |
+
+The recommended pattern for an automation main-agent is:
+
+```bash
+# 1. Fire-and-forget: parent does NOT need to tail the child terminal.
+nohup claw subagent batch -p 4 -t 90 -r 1 \
+    -R /tmp/claw_report.json -f tasks.txt > /tmp/claw_batch.log 2>&1 &
+
+# 2. Do other work, then poll the report file (cheap, race-free).
+while [ ! -f /tmp/claw_report.json ]; do
+    do_other_things
+    sleep 5
+done
+
+# 3. Consume the structured result.
+jq '.batch, (.results[] | {index, exit_code, timed_out, attempts})' /tmp/claw_report.json
+```
+
+This eliminates the "main agent blocks on child stdout" anti-pattern: the
+parent simply checks if the file exists. Inside, every task carries
+`exit_code`, `duration_ms`, `attempts`, `timed_out`, `stdout`, `stderr`, and
+the top-level `batch` block carries `total / parallel / failed / timed_out /
+timeout_secs / retries / completed_at`.
+
+### 7. Cross-distro installer
+
+Install on most Linux distros (Ubuntu/Debian, Fedora/RHEL, Arch, openSUSE,
+Alpine), WSL2, and macOS (via Homebrew) with a single script:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Asiiijl/Claw-Code-DeepSeek-Default-Proxy/feat/batch-timeout-retries-report/install-claw.sh -o install-claw.sh
+chmod +x install-claw.sh
+./install-claw.sh                  # default install
+./install-claw.sh --dir /opt/claw  # custom path
+./install-claw.sh --skip-deps      # if you already have git/cc/make/rustup
+./install-claw.sh --no-rc          # don't touch ~/.bashrc / ~/.zshrc
+```
+
+What it does: detects the package manager (`apt-get` / `dnf` / `yum` /
+`pacman` / `zypper` / `apk` / `brew`), installs build tools, installs
+`rustup` (minimal stable profile) if `cargo` is missing, clones this fork,
+runs `cargo build --release -p rusty-claude-cli`, symlinks
+`~/.local/bin/claw`, optionally injects an idempotent block into your
+shell rc (`~/.bashrc` / `~/.zshrc` / fish), and prints a WSL-specific proxy
+hint only when WSL is detected (`/proc/version` containing `microsoft`).
+
 ---
 
 ## 🔧 Proxy Configuration

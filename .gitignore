@@ -15,3 +15,6 @@ rust/diag_ddg/
 nul
 # Legacy Python port session scratch artifacts
 .port_sessions/
+
+# Sandbox cargo/rustup home (created when running cargo with HOME override)
+rust/.sandbox-home/
