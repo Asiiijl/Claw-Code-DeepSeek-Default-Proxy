@@ -12,7 +12,8 @@ pub use client::{
 };
 pub use error::ApiError;
 pub use http_client::{
-    build_http_client, build_http_client_or_default, build_http_client_with, ProxyConfig,
+    build_blocking_http_client_with, build_http_client, build_http_client_or_default,
+    build_http_client_with, ProxyConfig,
 };
 pub use prompt_cache::{
     CacheBreakEvent, PromptCache, PromptCacheConfig, PromptCachePaths, PromptCacheRecord,

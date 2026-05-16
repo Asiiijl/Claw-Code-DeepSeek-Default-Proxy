@@ -1,234 +1,294 @@
-# Claw Code
+# Claw Code — DeepSeek Subagent Fork
 
 <p align="center">
-  <a href="https://github.com/ultraworkers/claw-code">ultraworkers/claw-code</a>
-  ·
-  <a href="./USAGE.md">Usage</a>
-  ·
-  <a href="./rust/README.md">Rust workspace</a>
-  ·
-  <a href="./PARITY.md">Parity</a>
-  ·
-  <a href="./ROADMAP.md">Roadmap</a>
-  ·
-  <a href="./CONTRIBUTING.md">Contributing</a>
-  ·
-  <a href="./SECURITY.md">Security</a>
-  ·
-  <a href="https://discord.gg/5TUQKqFWd">UltraWorkers Discord</a>
+  <a href="https://github.com/ultraworkers/claw-code">upstream: ultraworkers/claw-code</a>
 </p>
 
-<p align="center">
-  <a href="https://star-history.com/#ultraworkers/claw-code&Date">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date&theme=dark" />
-      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date" />
-      <img alt="Star history for ultraworkers/claw-code" src="https://api.star-history.com/svg?repos=ultraworkers/claw-code&type=Date" width="600" />
-    </picture>
-  </a>
-</p>
+> **This fork** is customized for **DeepSeek API** integration with automatic proxy support
+> and a working `subagent spawn` CLI command. Designed for users behind firewalls (China/GFW)
+> who need DuckDuckGo web search and OpenAI-compatible model access through a proxy tunnel.
 
-<p align="center">
-  <img src="assets/claw-hero.jpeg" alt="Claw Code" width="300" />
-</p>
+---
 
-Claw Code is the public Rust implementation of the `claw` CLI agent harness.
-The canonical implementation lives in [`rust/`](./rust), and the current source of truth for this repository is **ultraworkers/claw-code**.
+## ✨ What's Different from Upstream
 
-> [!IMPORTANT]
-> Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows. For file submission/navigation questions, see [Navigation and file context](./docs/navigation-file-context.md). For local OpenAI-compatible models and offline skill installs, see [Local OpenAI-compatible providers and skills setup](./docs/local-openai-compatible-providers.md). Windows users can jump to the PowerShell-first [Windows install and release quickstart](./docs/windows-install-release.md). Make `claw doctor` your first health check after building, use [`rust/README.md`](./rust/README.md) for crate-level details, read [`PARITY.md`](./PARITY.md) for the current Rust-port checkpoint, and see [`docs/container.md`](./docs/container.md) for the container-first workflow.
->
-> **ACP / Zed status:** `claw-code` does not ship an ACP/Zed daemon or JSON-RPC entrypoint yet. Run `claw acp` (or `claw --acp`) for the current status instead of guessing from source layout; `claw acp serve` is currently a discoverability alias only, returns status with exit code 0, and real ACP support remains tracked separately in `ROADMAP.md`. For the public JSON contract, see [`docs/g011-acp-json-rpc-status-contract.md`](./docs/g011-acp-json-rpc-status-contract.md).
+| Feature | Upstream | This Fork |
+|---|---|---|
+| **Default LLM Backend** | Anthropic Claude | **DeepSeek** (`openai/deepseek-chat`) |
+| **`subagent spawn`** | Stub / no implementation | Fully working, no `--model` needed |
+| **WebSearch proxy** | No proxy support | Reads `HTTP_PROXY` / `HTTPS_PROXY` from env & config |
+| **CLI default model** | `claude-opus-4-6` | `openai/deepseek-chat` (no `--model` flag required) |
+| **Config-based proxy** | — | Loads proxy from `.claw.json` `"env"` block (Windows-safe) |
+| **`openai/` prefix routing** | Always preserves prefix | Strips `openai/` prefix for DeepSeek API (which rejects it) |
 
-## Current repository shape
+---
 
-- **`rust/`** — canonical Rust workspace and the `claw` CLI binary
-- **`USAGE.md`** — task-oriented usage guide for the current product surface
-- **`PARITY.md`** — Rust-port parity status and migration notes
-- **`ROADMAP.md`** — active roadmap and cleanup backlog
-- **`PHILOSOPHY.md`** — project intent and system-design framing
-- **`src/` + `tests/`** — companion Python/reference workspace and audit helpers; not the primary runtime surface
+## 🚀 Quick Start (DeepSeek)
 
-## Quick start
+### 1. Prerequisites
 
-> [!NOTE]
-> [!WARNING]
-> **`cargo install claw-code` installs the wrong thing.** The `claw-code` crate on crates.io is a deprecated stub that places `claw-code-deprecated.exe` — not `claw`. Running it only prints `"claw-code has been renamed to agent-code"`. **Do not use `cargo install claw-code`.** Either build from source (this repo) or install the upstream binary:
-> ```bash
-> cargo install agent-code   # upstream binary — installs 'agent.exe' (Windows) / 'agent' (Unix), NOT 'agent-code'
-> ```
-> This repo (`ultraworkers/claw-code`) is **build-from-source only** — follow the steps below.
+- [Rust](https://rustup.rs/) 1.80+
+- A [DeepSeek API key](https://platform.deepseek.com/api_keys)
+- (Optional, in China) A proxy client like Clash Verge / v2ray running on `http://127.0.0.1:7897`
+
+### 2. Clone and Build
 
 ```bash
-# 1. Clone and build
-git clone https://github.com/ultraworkers/claw-code
+git clone <your-fork-url> claw-code
 cd claw-code/rust
-cargo build --workspace
-
-# 2. Set your API key (Anthropic API key — not a Claude subscription)
-export ANTHROPIC_API_KEY="sk-ant-..."
-
-# 3. Verify everything is wired correctly
-./target/debug/claw doctor
-
-# 4. Run a prompt
-./target/debug/claw prompt "say hello"
+cargo build --release -p rusty-claude-cli
 ```
 
-> [!NOTE]
-> **Windows (PowerShell):** the binary is `claw.exe`, not `claw`. Use `.\target\debug\claw.exe` or run `cargo run -- prompt "say hello"` to skip the path lookup.
+The binary is at `rust/target/release/claw` (or `claw.exe` on Windows).
 
-### Windows setup
+### 3. Set Environment Variables
 
-**PowerShell is a supported Windows path.** Use whichever shell works for you. The common onboarding issues on Windows are:
-
-1. **Install Rust first** — download from <https://rustup.rs/> and run the installer. Close and reopen your terminal when it finishes.
-2. **Verify Rust is on PATH:**
-   ```powershell
-   cargo --version
-   ```
-   If this fails, reopen your terminal or run the PATH setup from the Rust installer output, then retry.
-3. **Clone and build** (works in PowerShell, Git Bash, or WSL):
-   ```powershell
-   git clone https://github.com/ultraworkers/claw-code
-   cd claw-code/rust
-   cargo build --workspace
-   ```
-4. **Run** (PowerShell — note `.exe` and backslash):
-   ```powershell
-   $env:ANTHROPIC_API_KEY = "sk-ant-..."
-   .\target\debug\claw.exe prompt "say hello"
-   ```
-
-For release ZIPs, PATH setup, provider switching, and notification smoke checks, see [`docs/windows-install-release.md`](./docs/windows-install-release.md).
-
-**Git Bash / WSL** are optional alternatives, not requirements. If you prefer bash-style paths (`/c/Users/you/...` instead of `C:\Users\you\...`), Git Bash (ships with Git for Windows) works well. In Git Bash, the `MINGW64` prompt is expected and normal — not a broken install.
-
-## Post-build: locate the binary and verify
-
-After running `cargo build --workspace`, the `claw` binary is built but **not** automatically installed to your system. Here's where to find it and how to verify the build succeeded.
-
-### Binary location
-
-After `cargo build --workspace` in `claw-code/rust/`:
-
-**Debug build (default, faster compile):**
-- **macOS/Linux:** `rust/target/debug/claw`
-- **Windows:** `rust/target/debug/claw.exe`
-
-**Release build (optimized, slower compile):**
-- **macOS/Linux:** `rust/target/release/claw`
-- **Windows:** `rust/target/release/claw.exe`
-
-If you ran `cargo build` without `--release`, the binary is in the `debug/` folder.
-
-### Verify the build succeeded
-
-Test the binary directly using its path:
+**Required — tells claw to use DeepSeek instead of Anthropic:**
 
 ```bash
-# macOS/Linux (debug build)
-./rust/target/debug/claw --help
-./rust/target/debug/claw doctor
-
-# Windows PowerShell (debug build)
-.\rust\target\debug\claw.exe --help
-.\rust\target\debug\claw.exe doctor
+export OPENAI_API_KEY="sk-<your-deepseek-key>"
+export OPENAI_BASE_URL="https://api.deepseek.com/v1"
 ```
 
-PowerShell smoke commands that do not require live credentials:
+**Optional — model override (defaults to `deepseek-chat` → `deepseek-v4-flash`):**
+
+```bash
+export ANTHROPIC_MODEL="openai/deepseek-chat"
+```
+
+**Proxy (required in China / GFW environments):**
+
+```bash
+export HTTPS_PROXY="http://127.0.0.1:7897"
+export HTTP_PROXY="http://127.0.0.1:7897"
+export NO_PROXY="localhost,127.0.0.1"
+```
+
+<details>
+<summary><b>Windows (PowerShell)</b></summary>
 
 ```powershell
-$env:CLAW_CONFIG_HOME = Join-Path $env:TEMP "claw config home"
-New-Item -ItemType Directory -Force -Path $env:CLAW_CONFIG_HOME | Out-Null
-Remove-Item Env:\ANTHROPIC_API_KEY, Env:\ANTHROPIC_AUTH_TOKEN, Env:\OPENAI_API_KEY -ErrorAction SilentlyContinue
-.\rust\target\debug\claw.exe help
-.\rust\target\debug\claw.exe status
-.\rust\target\debug\claw.exe config env
-.\rust\target\debug\claw.exe doctor
+$env:OPENAI_API_KEY = "sk-<your-deepseek-key>"
+$env:OPENAI_BASE_URL = "https://api.deepseek.com/v1"
+$env:HTTPS_PROXY = "http://127.0.0.1:7897"
+$env:HTTP_PROXY = "http://127.0.0.1:7897"
+$env:NO_PROXY = "localhost,127.0.0.1"
 ```
 
-If these commands succeed, the build is working. `claw doctor` is your first health check — it validates your API key, model access, and tool configuration.
+Add these to your PowerShell profile (`$PROFILE`) so they persist across terminal sessions:
+```powershell
+# Check profile path
+$PROFILE
 
-### Optional: Add to PATH
-
-If you want to run `claw` from any directory without the full path, choose one of these approaches:
-
-**Option 1: Symlink (macOS/Linux)**
-```bash
-ln -s $(pwd)/rust/target/debug/claw /usr/local/bin/claw
-```
-Then reload your shell and test:
-```bash
-claw --help
+# Edit profile (creates if missing)
+notepad $PROFILE
 ```
 
-**Option 2: Use `cargo install` (all platforms)**
+Paste the `$env:` lines above and save. Restart your terminal.
+</details>
 
-Build and install to Cargo's default location (`~/.cargo/bin/`, which is usually on PATH):
-```bash
-# From the claw-code/rust/ directory
-cargo install --path . --force
-
-# Then from anywhere
-claw --help
-```
-
-**Option 3: Update shell profile (bash/zsh)**
-
-Add this line to `~/.bashrc` or `~/.zshrc`:
-```bash
-export PATH="$(pwd)/rust/target/debug:$PATH"
-```
-
-Reload your shell:
-```bash
-source ~/.bashrc  # or source ~/.zshrc
-claw --help
-```
-
-### Troubleshooting
-
-- **"command not found: claw"** — The binary is in `rust/target/debug/claw`, but it's not on your PATH. Use the full path `./rust/target/debug/claw` or symlink/install as above.
-- **"permission denied"** — On macOS/Linux, you may need `chmod +x rust/target/debug/claw` if the executable bit isn't set (rare).
-- **Debug vs. release** — If the build is slow, you're in debug mode (default). Add `--release` to `cargo build` for faster runtime, but the build itself will take 5–10 minutes.
-
-> [!NOTE]
-> **Auth:** claw requires an **API key** (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, etc.) — Claude subscription login is not a supported auth path.
-
-Run the workspace test suite after verifying the binary works:
+### 4. Health Check
 
 ```bash
-cd rust
-cargo test --workspace
+# Quick prompt — verifies DeepSeek API connectivity
+claw prompt "say hello"
 ```
 
-## Documentation map
+> **No `--model` flag needed!** The compiled default is now `openai/deepseek-chat`.
 
-- [`USAGE.md`](./USAGE.md) — quick commands, auth, sessions, config, parity harness
-- [`docs/navigation-file-context.md`](./docs/navigation-file-context.md) — terminal navigation, scrollback, `@path` file context, attachments, and secret-safety guidance
-- [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md) — Ollama/llama.cpp/vLLM setup, Claw multi-provider positioning, and local skills install checks
-- [`docs/windows-install-release.md`](./docs/windows-install-release.md) — PowerShell-first install, release artifact, provider switching, and Windows/WSL notification smoke paths
-- [`rust/README.md`](./rust/README.md) — crate map, CLI surface, features, workspace layout
-- [`PARITY.md`](./PARITY.md) — parity status for the Rust port
-- [`rust/MOCK_PARITY_HARNESS.md`](./rust/MOCK_PARITY_HARNESS.md) — deterministic mock-service harness details
-- [`ROADMAP.md`](./ROADMAP.md) — active roadmap and open cleanup work
-- [`docs/g004-events-reports-contract.md`](./docs/g004-events-reports-contract.md) — Stream 2 lane event/report contract guidance for consumers
-- [`PHILOSOPHY.md`](./PHILOSOPHY.md) — why the project exists and how it is operated
-- [`CONTRIBUTING.md`](./CONTRIBUTING.md), [`SECURITY.md`](./SECURITY.md), [`SUPPORT.md`](./SUPPORT.md), and [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md) — contribution, vulnerability-reporting, support, and community policies
-- [`LICENSE`](./LICENSE) — MIT license for this repository
+### 5. Use `subagent spawn`
 
-## Ecosystem
+The killer feature. Spawn a sub-agent that has web search + file read + bash access:
 
-Claw Code is built in the open alongside the broader UltraWorkers toolchain:
+```bash
+claw subagent spawn "查一下北京现在的天气"
+claw subagent spawn "Search the web for latest AI news and summarize"
+```
 
-- [clawhip](https://github.com/Yeachan-Heo/clawhip)
-- [oh-my-openagent](https://github.com/code-yeongyu/oh-my-openagent)
-- [oh-my-claudecode](https://github.com/Yeachan-Heo/oh-my-claudecode)
-- [oh-my-codex](https://github.com/Yeachan-Heo/oh-my-codex)
-- [UltraWorkers Discord](https://discord.gg/5TUQKqFWd)
+Override per-command if needed:
+```bash
+claw --model openai/gpt-4.1-mini subagent spawn "use a different model"
+```
 
-## Ownership / affiliation disclaimer
+---
 
-- This repository does **not** claim ownership of the original Claude Code source material.
-- This repository is **not affiliated with, endorsed by, or maintained by Anthropic**.
+## 🔧 Proxy Configuration
+
+### Problem
+
+On **Windows**, the `terminal` tool used by AI agents spawns `claw` in a separate `sh`/cmd process
+that **does not inherit** PowerShell profile environment variables (`$env:HTTPS_PROXY`).
+This causes DuckDuckGo `WebSearch` requests to fail with timeouts behind the GFW,
+even though wttr.in and httpbin.org work (they are directly reachable from China).
+
+### Solution: Dual-Layer Proxy Injection
+
+This fork applies proxy settings at **two independent layers**:
+
+#### Layer 1: Environment Variables (fast path)
+
+`HTTPS_PROXY` / `HTTP_PROXY` are read by `api::ProxyConfig::from_env()` at runtime.
+Works on macOS/Linux and when the terminal shell has the variables set.
+
+#### Layer 2: `.claw.json` Config Bootstrap (Windows-safe path)
+
+In `main.rs` → `run()`, claw loads `.claw.json` and `.claw/settings.json` **before any network call**,
+reads the `"env"` block, and injects `HTTPS_PROXY`/`HTTP_PROXY`/`NO_PROXY` into `std::env`.
+This happens at the process level, so child `reqwest::Client` builders can see them.
+
+**To configure** — edit your `.claw.json` (project root):
+
+```json
+{
+  "aliases": {
+    "quick": "haiku"
+  },
+  "env": {
+    "HTTPS_PROXY": "http://127.0.0.1:7897",
+    "HTTP_PROXY": "http://127.0.0.1:7897",
+    "NO_PROXY": "localhost,127.0.0.1"
+  }
+}
+```
+
+This is **required for Windows** when `claw` is invoked by an AI agent via the `terminal` tool.
+Without it, `WebSearch` (DuckDuckGo) calls will fail silently.
+
+### How Web Search Routes Through Proxy
+
+```
+claw subagent spawn "weather"
+  → main.rs: loads .claw.json → sets env vars (Layer 2)
+  → parse_args: detect_subagent_model_from_env()
+  → tools/build_http_client: api::build_blocking_http_client_with(ProxyConfig::from_env())
+  → reqwest::Client with Proxy::https("http://127.0.0.1:7897") + Proxy::http(...)
+  → WebSearch → DuckDuckGo via proxy ✅
+  → WebFetch → wttr.in directly (no proxy needed, DDNS reachable)
+```
+
+---
+
+## 🔌 DeepSeek API Integration Details
+
+### Model Routing
+
+When you use `openai/deepseek-chat` as the model name:
+- The `openai/` prefix routes the request to the **OpenAI-compatible provider**
+- The wire function `wire_model_for_base_url()` detects the base URL contains `"deepseek"` and **strips** the `openai/` prefix, sending `deepseek-chat` on the wire
+- DeepSeek server resolves `deepseek-chat` → `deepseek-v4-flash` internally
+
+### V4 Reasoning Content
+
+DeepSeek V4 models (`deepseek-v4-pro`, `deepseek-v4-flash`) return `reasoning_content` in their
+streaming responses. This fork properly:
+- Detects V4 models via `model_requires_reasoning_content_in_history()`
+- Echoes prior `reasoning_content` back in assistant history messages
+- Emits `thinking` blocks before text blocks in non-streaming responses
+
+### Required Environment Variables
+
+| Variable | Required | Value |
+|---|---|---|
+| `OPENAI_API_KEY` | ✅ Yes | `sk-...` (DeepSeek API key) |
+| `OPENAI_BASE_URL` | ✅ Yes | `https://api.deepseek.com/v1` |
+| `HTTPS_PROXY` | 🔶 China-only | `http://127.0.0.1:7897` |
+| `HTTP_PROXY` | 🔶 China-only | `http://127.0.0.1:7897` |
+| `NO_PROXY` | 🔶 China-only | `localhost,127.0.0.1` |
+
+### Optional Variables
+
+| Variable | Effect |
+|---|---|
+| `ANTHROPIC_MODEL` | Override the auto-detected model name |
+| `CLAW_CONFIG_HOME` | Custom config directory (defaults to `~/.claw`) |
+
+---
+
+## 🧩 Code Changes Summary
+
+### `rust/crates/api/src/http_client.rs`
+- Added `build_blocking_http_client_with()` — shared proxy logic for blocking (sync) clients
+- Added `ProxyBuilder` trait to abstract proxy injection over `ClientBuilder` + `blocking::ClientBuilder`
+- Sets 20s timeout, redirect limit, and user-agent
+
+### `rust/crates/api/Cargo.toml`
+- Added `blocking` feature to `reqwest` dependency
+
+### `rust/crates/tools/src/lib.rs`
+- `build_http_client()` now delegates to `api::build_blocking_http_client_with(api::ProxyConfig::from_env())`
+- Removed duplicate proxy-reading code (was reading env vars independently, missing `NO_PROXY` and `.no_proxy()`)
+
+### `rust/crates/rusty-claude-cli/src/main.rs`
+- **Default model changed** from `claude-opus-4-6` to `openai/deepseek-chat` — no `--model` flag needed
+- Added **config bootstrap** in `run()` — loads proxy from `.claw.json` `"env"` block before network
+- `parse_args()`: `"subagent"` match arm with `spawn`/`list`/`steer` subcommands
+- `detect_subagent_model_from_env()`: auto-detects DeepSeek when `OPENAI_BASE_URL` + `OPENAI_API_KEY` are set
+- Removed duplicate function definitions (cleanup)
+
+### `rust/crates/api/src/providers/openai_compat.rs`
+- `wire_model_for_base_url()`: strips `openai/` prefix for DeepSeek base URL (which rejects prefixed model names)
+
+### `.claw.json`
+- Added `"env"` block with proxy configuration consumed by the config bootstrap
+
+---
+
+## 🧪 Verification Checklist
+
+After setup, run these to confirm everything works:
+
+```bash
+# 1. Build succeeds
+cargo build --release -p rusty-claude-cli
+
+# 2. DeepSeek API responds (no --model!)
+claw prompt "hello"
+
+# 3. Subagent spawn works
+claw subagent spawn "北京天气"
+
+# 4. WebSearch goes through proxy (should complete < 2s)
+claw subagent spawn "Use WebSearch to search for test and say done"
+
+# 5. WebFetch fallback works
+claw subagent spawn "Fetch https://wttr.in/Beijing?format=4 and summarize"
+```
+
+---
+
+## 📦 Arch Linux Migration
+
+If migrating from Windows to Arch Linux, copy these portable files:
+
+- `claw-code-arch-patches.patch` — all code changes in one git patch
+- `claw-code-arch-setup.sh` — one-click setup: dependencies → clone → apply → build → `.bashrc`
+
+The setup script handles:
+```bash
+# Install Rust, git, build deps
+# Clone this repo
+# Apply patch
+# Build release
+# Write .bashrc with env vars + PATH
+```
+
+---
+
+## 📚 Additional Documentation
+
+- [`USAGE.md`](./USAGE.md) — upstream usage guide (build, auth, CLI, session management, parity harness)
+- [`rust/README.md`](./rust/README.md) — crate map, workspace layout, CLI surface, features
+- [`docs/navigation-file-context.md`](./docs/navigation-file-context.md) — terminal navigation, scrollback, `@path` file context
+- [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md) — Ollama/llama.cpp/vLLM, OpenRouter, local skills
+- [`docs/windows-install-release.md`](./docs/windows-install-release.md) — Windows release install, provider switching, notification smoke paths
+- [`PARITY.md`](./PARITY.md) — Rust-port parity status and migration notes
+- [`ROADMAP.md`](./ROADMAP.md) — active roadmap and cleanup backlog
+- [`CONTRIBUTING.md`](./CONTRIBUTING.md), [`SECURITY.md`](./SECURITY.md), [`SUPPORT.md`](./SUPPORT.md), [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md)
+
+---
+
+## License
+
+MIT — see [`LICENSE`](./LICENSE).
+
+*This repository is not affiliated with, endorsed by, or maintained by Anthropic or DeepSeek.*

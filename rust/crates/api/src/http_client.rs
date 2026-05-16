@@ -82,7 +82,33 @@ pub fn build_http_client_or_default() -> reqwest::Client {
 /// proxy so a single value can route every outbound request.
 pub fn build_http_client_with(config: &ProxyConfig) -> Result<reqwest::Client, ApiError> {
     let mut builder = reqwest::Client::builder().no_proxy();
+    apply_proxy_config(&mut builder, config)?;
+    Ok(builder.build()?)
+}
 
+/// Build a blocking `reqwest::blocking::Client` from an explicit [`ProxyConfig`].
+///
+/// Same proxy resolution as [`build_http_client_with`], but returns a blocking
+/// client for synchronous call sites (e.g. the `tools` crate for web_search
+/// and web_fetch).
+pub fn build_blocking_http_client_with(
+    config: &ProxyConfig,
+) -> Result<reqwest::blocking::Client, ApiError> {
+    let mut builder = reqwest::blocking::Client::builder()
+        .no_proxy()
+        .timeout(std::time::Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::limited(10))
+        .user_agent("clawd-rust-tools/0.1");
+    apply_proxy_config(&mut builder, config)?;
+    Ok(builder.build()?)
+}
+
+/// Shared helper that registers HTTP/HTTPS proxies from a [`ProxyConfig`]
+/// onto any reqwest builder type that exposes a `proxy()` method.
+fn apply_proxy_config<B>(builder: &mut B, config: &ProxyConfig) -> Result<(), ApiError>
+where
+    B: ProxyBuilder,
+{
     let no_proxy = config
         .no_proxy
         .as_deref()
@@ -98,7 +124,7 @@ pub fn build_http_client_with(config: &ProxyConfig) -> Result<reqwest::Client, A
         if let Some(filter) = no_proxy.clone() {
             proxy = proxy.no_proxy(Some(filter));
         }
-        builder = builder.proxy(proxy);
+        builder.add_proxy(proxy);
     }
 
     if let Some(url) = http_proxy_url {
@@ -106,10 +132,28 @@ pub fn build_http_client_with(config: &ProxyConfig) -> Result<reqwest::Client, A
         if let Some(filter) = no_proxy.clone() {
             proxy = proxy.no_proxy(Some(filter));
         }
-        builder = builder.proxy(proxy);
+        builder.add_proxy(proxy);
     }
 
-    Ok(builder.build()?)
+    Ok(())
+}
+
+/// Minimal abstraction over `ClientBuilder` and `blocking::ClientBuilder`
+/// so [`apply_proxy_config`] can work with both.
+trait ProxyBuilder {
+    fn add_proxy(&mut self, proxy: reqwest::Proxy);
+}
+
+impl ProxyBuilder for reqwest::ClientBuilder {
+    fn add_proxy(&mut self, proxy: reqwest::Proxy) {
+        *self = Self::proxy(std::mem::take(self), proxy);
+    }
+}
+
+impl ProxyBuilder for reqwest::blocking::ClientBuilder {
+    fn add_proxy(&mut self, proxy: reqwest::Proxy) {
+        *self = Self::proxy(std::mem::take(self), proxy);
+    }
 }
 
 fn first_non_empty<F>(keys: &[&str], lookup: &mut F) -> Option<String>
@@ -124,7 +168,7 @@ where
 mod tests {
     use std::collections::HashMap;
 
-    use super::{build_http_client_with, ProxyConfig};
+    use super::{build_blocking_http_client_with, build_http_client_with, ProxyConfig};
 
     fn config_from_map(pairs: &[(&str, &str)]) -> ProxyConfig {
         let map: HashMap<String, String> = pairs
@@ -242,6 +286,18 @@ mod tests {
     }
 
     #[test]
+    fn build_blocking_http_client_succeeds_when_no_proxy_is_configured() {
+        // given
+        let config = ProxyConfig::default();
+
+        // when
+        let result = build_blocking_http_client_with(&config);
+
+        // then
+        assert!(result.is_ok());
+    }
+
+    #[test]
     fn build_http_client_succeeds_with_valid_http_and_https_proxies() {
         // given
         let config = ProxyConfig {
@@ -253,6 +309,23 @@ mod tests {
 
         // when
         let result = build_http_client_with(&config);
+
+        // then
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn build_blocking_http_client_succeeds_with_valid_http_and_https_proxies() {
+        // given
+        let config = ProxyConfig {
+            http_proxy: Some("http://proxy.internal:3128".to_string()),
+            https_proxy: Some("http://secure.internal:3129".to_string()),
+            no_proxy: Some("localhost,127.0.0.1".to_string()),
+            proxy_url: None,
+        };
+
+        // when
+        let result = build_blocking_http_client_with(&config);
 
         // then
         assert!(result.is_ok());

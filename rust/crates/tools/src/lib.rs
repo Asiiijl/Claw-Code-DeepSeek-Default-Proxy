@@ -2985,12 +2985,8 @@ fn execute_web_search(input: &WebSearchInput) -> Result<WebSearchOutput, String>
 }
 
 fn build_http_client() -> Result<Client, String> {
-    Client::builder()
-        .timeout(Duration::from_secs(20))
-        .redirect(reqwest::redirect::Policy::limited(10))
-        .user_agent("clawd-rust-tools/0.1")
-        .build()
-        .map_err(|error| error.to_string())
+    let config = api::ProxyConfig::from_env();
+    api::build_blocking_http_client_with(&config).map_err(|e| e.to_string())
 }
 
 fn normalize_fetch_url(url: &str) -> Result<String, String> {

@@ -58,7 +58,7 @@ use tools::{
     execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
 };
 
-const DEFAULT_MODEL: &str = "claude-opus-4-6";
+const DEFAULT_MODEL: &str = "openai/deepseek-chat";
 
 /// #148: Model provenance for `claw status` JSON/text output. Records where
 /// the resolved model string came from so claws don't have to re-read argv
@@ -295,6 +295,37 @@ fn split_error_hint(message: &str) -> (String, Option<String>) {
     }
 }
 
+/// Auto-detect the model for `claw subagent spawn` when no `--model` flag was passed.
+///
+/// Priority:
+/// 1. `OPENAI_BASE_URL` + `OPENAI_API_KEY` both set → `openai/deepseek-chat`
+/// 2. `ANTHROPIC_MODEL` env var → resolved alias
+/// 3. Config file model → resolved alias
+/// 4. Compiled `DEFAULT_MODEL`
+fn detect_subagent_model_from_env() -> String {
+    let has_openai_base = std::env::var("OPENAI_BASE_URL")
+        .ok()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let has_openai_key = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if has_openai_base && has_openai_key {
+        return String::from("openai/deepseek-chat");
+    }
+    if let Ok(env_model) = std::env::var("ANTHROPIC_MODEL") {
+        let trimmed = env_model.trim().to_string();
+        if !trimmed.is_empty() {
+            return resolve_model_alias_with_config(&trimmed);
+        }
+    }
+    if let Some(config_model) = config_model_for_current_dir() {
+        return resolve_model_alias_with_config(&config_model);
+    }
+    DEFAULT_MODEL.to_string()
+}
+
 /// Read piped stdin content when stdin is not a terminal.
 ///
 /// Returns `None` when stdin is attached to a terminal (interactive REPL use),
@@ -388,6 +419,34 @@ fn plugin_load_failure_json(failure: &plugins::PluginLoadFailure) -> Value {
 }
 
 fn run() -> Result<(), Box<dyn std::error::Error>> {
+    // Bootstrap proxy settings from config files before any network call.
+    // On Windows the terminal/subprocess shell may not inherit the user's
+    // PowerShell profile environment variables (HTTPS_PROXY, HTTP_PROXY,
+    // NO_PROXY), so we reload them here from .claw.json / .claw/settings.json
+    // which the user *can* configure persistently.
+    let cwd = std::env::current_dir().ok();
+    if let Some(cwd) = cwd.as_ref() {
+        let loader = runtime::ConfigLoader::default_for(cwd);
+        if let Ok(config) = loader.load() {
+            if let Some(env_obj) = config.get("env").and_then(|v| v.as_object()) {
+                for proxy_key in &[
+                    "HTTPS_PROXY",
+                    "https_proxy",
+                    "HTTP_PROXY",
+                    "http_proxy",
+                    "NO_PROXY",
+                    "no_proxy",
+                ] {
+                    if let Some(val) = env_obj.get(*proxy_key).and_then(|v| v.as_str()) {
+                        if !val.is_empty() && std::env::var(*proxy_key).is_err() {
+                            std::env::set_var(proxy_key, val);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args)? {
         CliAction::DumpManifests {
@@ -992,6 +1051,54 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             Ok(CliAction::Diff { output_format })
         }
+        // ### Alternative: Using `claw` in the terminal
+        // You can also use the `claw` CLI tool via the `terminal` tool to spawn subagents.
+        // Running `claw subagent spawn <message>` in the console will start a subagent session
+        // with the given prompt. This is useful when you need to run tasks outside the
+        // current agent context or when you want to leverage `claw`'s capabilities.
+        // Use `claw subagent list` to see active subagent sessions and
+        // `claw subagent steer <target> <msg>` to send follow-up messages.
+        "subagent" => {
+            let args: Vec<&str> = rest[1..].iter().map(String::as_str).collect();
+            match args.first().copied() {
+                Some("spawn") => {
+                    let msg = args[1..].join(" ");
+                    if msg.trim().is_empty() {
+                        return Err("subagent spawn requires a message".to_string());
+                    }
+                    // Auto-detect model from env when no --model was passed.
+                    // If OPENAI_BASE_URL + OPENAI_API_KEY are set, default to
+                    // openai/deepseek-chat so subagent spawn works without
+                    // needing --model on every invocation. If ANTHROPIC_MODEL
+                    // is set, use that instead. Otherwise use the compiled default.
+                    let spawn_model = if model == DEFAULT_MODEL {
+                        detect_subagent_model_from_env()
+                    } else {
+                        model.clone()
+                    };
+                    Ok(CliAction::Prompt {
+                        prompt: msg,
+                        model: spawn_model,
+                        output_format,
+                        allowed_tools,
+                        permission_mode,
+                        compact,
+                        base_commit,
+                        reasoning_effort: reasoning_effort.clone(),
+                        allow_broad_cwd,
+                    })
+                }
+                Some("list") | None => Err(
+                    "Subagent sessions are managed inside the interactive REPL.\n  Start: claw\n  Then:  /subagent list\n  Or:    /parallel <count> <prompt>".to_string(),
+                ),
+                Some("steer") => Err(
+                    "Subagent steering is done inside the interactive REPL.\n  Start: claw\n  Then:  /subagent steer <target> <msg>".to_string(),
+                ),
+                Some(other) => Err(format!(
+                    "unknown subagent subcommand: '{other}'. Use 'spawn', 'list', or 'steer'."
+                )),
+            }
+        }
         // `claw permissions <mode>` falls through to the LLM when called
         // with a subcommand argument because parse_single_word_command_alias
         // only intercepts the bare single-word form. Catch all multi-word
@@ -1418,6 +1525,7 @@ fn suggest_similar_subcommand(input: &str) -> Option<Vec<String>> {
         "agents",
         "mcp",
         "skills",
+        "subagent",
         "system-prompt",
         "acp",
         "init",

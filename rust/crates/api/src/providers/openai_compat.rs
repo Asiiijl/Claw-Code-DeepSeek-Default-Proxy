@@ -934,6 +934,11 @@ fn wire_model_for_base_url<'a>(
             // Preserve the slug when the user configured a non-default OpenAI
             // base URL; the prefix still routed to the OpenAI-compatible client,
             // but the gateway owns the final model namespace.
+            // However, DeepSeek API uses bare model names (e.g. "deepseek-chat")
+            // and rejects the openai/ prefix, so always strip it for DeepSeek.
+            if trimmed_base_url.contains("deepseek") {
+                return Cow::Borrowed(&model[pos + 1..]);
+            }
             return Cow::Borrowed(model);
         }
         return Cow::Borrowed(&model[pos + 1..]);

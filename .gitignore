@@ -10,5 +10,8 @@ archive/
 .claw/sessions/
 .clawhip/
 status-help.txt
+# Diagnostic tool (not part of the project)
+rust/diag_ddg/
+nul
 # Legacy Python port session scratch artifacts
 .port_sessions/
