@@ -326,6 +326,281 @@ fn detect_subagent_model_from_env() -> String {
     DEFAULT_MODEL.to_string()
 }
 
+/// Parse arguments for `claw subagent batch [--parallel N] [--file PATH | -]`.
+///
+/// Tasks come from either:
+/// * `--file PATH` — read the file, one task per line
+/// * `-` — read tasks from stdin (one per line, EOF terminates)
+/// * positional args — each remaining argument is a single task
+///
+/// Lines that are empty or start with `#` (after trimming) are skipped.
+/// `--parallel N` (alias `-p N`) caps concurrency. Default = 4. Hard cap = 32
+/// to prevent accidental fork-bomb against the upstream API.
+fn parse_subagent_batch_args(
+    rest: &[&str],
+    inherited_model: &str,
+    output_format: CliOutputFormat,
+) -> Result<CliAction, String> {
+    let mut parallel: usize = 4;
+    let mut file_path: Option<String> = None;
+    let mut from_stdin = false;
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i] {
+            "--parallel" | "-p" => {
+                let v = rest
+                    .get(i + 1)
+                    .ok_or_else(|| "--parallel requires a number".to_string())?;
+                parallel = v
+                    .parse::<usize>()
+                    .map_err(|_| format!("invalid --parallel value: '{v}'"))?;
+                if parallel == 0 {
+                    return Err("--parallel must be >= 1".to_string());
+                }
+                if parallel > 32 {
+                    return Err("--parallel must be <= 32 (safety cap)".to_string());
+                }
+                i += 2;
+            }
+            "--file" | "-f" => {
+                let v = rest
+                    .get(i + 1)
+                    .ok_or_else(|| "--file requires a path".to_string())?;
+                file_path = Some((*v).to_string());
+                i += 2;
+            }
+            "-" => {
+                from_stdin = true;
+                i += 1;
+            }
+            "--help" | "-h" => {
+                return Err(
+                    "usage: claw subagent batch [--parallel N] (--file PATH | - | TASK...)\n\
+                     \n\
+                     Dispatch multiple `subagent spawn` invocations in parallel.\n\
+                     Each non-empty, non-`#` line of the input becomes one task.\n\
+                     \n\
+                     Options:\n  \
+                       -p, --parallel N   Max concurrent agents (default 4, max 32)\n  \
+                       -f, --file PATH    Read tasks from a file (one per line)\n  \
+                       -                  Read tasks from stdin\n\
+                     \n\
+                     Examples:\n  \
+                       claw subagent batch -p 3 -f tasks.txt\n  \
+                       printf 'task A\\ntask B\\n' | claw subagent batch -\n  \
+                       claw subagent batch 'task one' 'task two' 'task three'"
+                        .to_string(),
+                );
+            }
+            other => {
+                positional.push(other.to_string());
+                i += 1;
+            }
+        }
+    }
+
+    let raw = if let Some(path) = file_path.as_deref() {
+        std::fs::read_to_string(path).map_err(|e| format!("failed to read --file '{path}': {e}"))?
+    } else if from_stdin {
+        let mut buf = String::new();
+        io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| format!("failed to read stdin: {e}"))?;
+        buf
+    } else if !positional.is_empty() {
+        positional.join("\n")
+    } else {
+        return Err(
+            "subagent batch requires --file PATH, '-' for stdin, or positional task args.\n\
+             See: claw subagent batch --help"
+                .to_string(),
+        );
+    };
+
+    let tasks: Vec<String> = raw
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(|l| l.to_string())
+        .collect();
+
+    if tasks.is_empty() {
+        return Err("no non-empty, non-comment tasks found in input".to_string());
+    }
+
+    // Inherit the spawn-time model auto-detection so DeepSeek/etc. is picked
+    // up without requiring --model on every batch invocation.
+    let model = if inherited_model == DEFAULT_MODEL {
+        detect_subagent_model_from_env()
+    } else {
+        inherited_model.to_string()
+    };
+
+    Ok(CliAction::SubagentBatch {
+        tasks,
+        parallel,
+        model,
+        output_format,
+    })
+}
+
+/// Execute the subagent batch by re-invoking the current binary with
+/// `subagent spawn <task>` for each task, with at most `parallel` running
+/// concurrently. Each task's combined stdout/stderr is captured and printed
+/// with a `[i/N] task: ...` banner so output stays attributable.
+///
+/// Returns the exit code to propagate (0 if all succeeded, 1 if any failed).
+fn subagent_batch_run(
+    tasks: &[String],
+    parallel: usize,
+    model: &str,
+    output_format: CliOutputFormat,
+) -> std::io::Result<i32> {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let total = tasks.len();
+    let exe = std::env::current_exe()?;
+    let next = Arc::new(AtomicUsize::new(0));
+    let tasks_shared: Arc<Vec<String>> = Arc::new(tasks.to_vec());
+    let model_shared = Arc::new(model.to_string());
+    let format_json = matches!(output_format, CliOutputFormat::Json);
+
+    #[derive(Clone)]
+    struct TaskResult {
+        index: usize,
+        task: String,
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+        duration_ms: u128,
+    }
+
+    let results: Arc<Mutex<Vec<TaskResult>>> = Arc::new(Mutex::new(Vec::with_capacity(total)));
+    let workers = parallel.min(total).max(1);
+    let mut handles: Vec<JoinHandle<()>> = Vec::with_capacity(workers);
+
+    for _ in 0..workers {
+        let exe = exe.clone();
+        let next = Arc::clone(&next);
+        let tasks_shared = Arc::clone(&tasks_shared);
+        let model_shared = Arc::clone(&model_shared);
+        let results = Arc::clone(&results);
+        handles.push(thread::spawn(move || loop {
+            let idx = next.fetch_add(1, Ordering::SeqCst);
+            if idx >= tasks_shared.len() {
+                return;
+            }
+            let task = tasks_shared[idx].clone();
+            let start = Instant::now();
+            let out = Command::new(&exe)
+                .arg("--model")
+                .arg(&*model_shared)
+                .arg("subagent")
+                .arg("spawn")
+                .arg(&task)
+                .output();
+            let res = match out {
+                Ok(o) => TaskResult {
+                    index: idx,
+                    task: task.clone(),
+                    exit_code: o.status.code().unwrap_or(-1),
+                    stdout: String::from_utf8_lossy(&o.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+                    duration_ms: start.elapsed().as_millis(),
+                },
+                Err(e) => TaskResult {
+                    index: idx,
+                    task: task.clone(),
+                    exit_code: -1,
+                    stdout: String::new(),
+                    stderr: format!("failed to spawn child: {e}"),
+                    duration_ms: start.elapsed().as_millis(),
+                },
+            };
+            if let Ok(mut g) = results.lock() {
+                g.push(res);
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+
+    let mut collected: Vec<TaskResult> = match Arc::try_unwrap(results) {
+        Ok(m) => m.into_inner().unwrap_or_default(),
+        Err(arc) => arc.lock().map(|g| g.clone()).unwrap_or_default(),
+    };
+    collected.sort_by_key(|r| r.index);
+
+    let mut failed = 0usize;
+    if format_json {
+        let arr: Vec<serde_json::Value> = collected
+            .iter()
+            .map(|r| {
+                if r.exit_code != 0 {
+                    failed += 1;
+                }
+                serde_json::json!({
+                    "index":       r.index,
+                    "task":        r.task,
+                    "exit_code":   r.exit_code,
+                    "duration_ms": r.duration_ms,
+                    "stdout":      r.stdout,
+                    "stderr":      r.stderr,
+                })
+            })
+            .collect();
+        let report = serde_json::json!({
+            "batch":  {
+                "total":    total,
+                "parallel": workers,
+                "model":    &*model_shared,
+                "failed":   failed,
+            },
+            "results": arr,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_default()
+        );
+    } else {
+        println!(
+            "▶ Claw subagent batch: total={total} parallel={workers} model={model}",
+            model = &*model_shared
+        );
+        println!();
+        for r in &collected {
+            let status = if r.exit_code == 0 { "OK" } else { "FAIL" };
+            if r.exit_code != 0 {
+                failed += 1;
+            }
+            println!(
+                "[{i}/{n}] {status} ({ms} ms) :: {task}",
+                i = r.index + 1,
+                n = total,
+                ms = r.duration_ms,
+                status = status,
+                task = r.task,
+            );
+            if !r.stdout.trim().is_empty() {
+                for line in r.stdout.lines() {
+                    println!("    │ {line}");
+                }
+            }
+            if r.exit_code != 0 && !r.stderr.trim().is_empty() {
+                for line in r.stderr.lines() {
+                    println!("    ✗ {line}");
+                }
+            }
+            println!();
+        }
+        println!("◀ Done: {ok} ok, {failed} failed", ok = total - failed);
+    }
+
+    Ok(if failed == 0 { 0 } else { 1 })
+}
+
 /// Read piped stdin content when stdin is not a terminal.
 ///
 /// Returns `None` when stdin is attached to a terminal (interactive REPL use),
@@ -583,6 +858,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
         } => print_help_topic(topic, output_format)?,
         CliAction::Help { output_format } => print_help(output_format)?,
+        CliAction::SubagentBatch {
+            tasks,
+            parallel,
+            model,
+            output_format,
+        } => {
+            let code = subagent_batch_run(&tasks, parallel, &model, output_format)?;
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
     }
     Ok(())
 }
@@ -691,6 +977,16 @@ enum CliAction {
     },
     // prompt-mode formatting is only supported for non-interactive runs
     Help {
+        output_format: CliOutputFormat,
+    },
+    /// Parallel cluster execution: dispatch N concurrent `subagent spawn`
+    /// child processes from a task file or stdin. Each non-empty, non-`#`
+    /// line becomes one independent subagent invocation. See
+    /// `subagent_batch_run` for the executor.
+    SubagentBatch {
+        tasks: Vec<String>,
+        parallel: usize,
+        model: String,
         output_format: CliOutputFormat,
     },
 }
@@ -1094,8 +1390,13 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 Some("steer") => Err(
                     "Subagent steering is done inside the interactive REPL.\n  Start: claw\n  Then:  /subagent steer <target> <msg>".to_string(),
                 ),
+                Some("batch") => parse_subagent_batch_args(
+                    &args[1..],
+                    &model,
+                    output_format,
+                ),
                 Some(other) => Err(format!(
-                    "unknown subagent subcommand: '{other}'. Use 'spawn', 'list', or 'steer'."
+                    "unknown subagent subcommand: '{other}'. Use 'spawn', 'batch', 'list', or 'steer'."
                 )),
             }
         }
@@ -15161,5 +15462,104 @@ mod dump_manifests_tests {
         );
 
         let _ = fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod subagent_batch_tests {
+    use super::{parse_subagent_batch_args, CliAction, CliOutputFormat, DEFAULT_MODEL};
+
+    fn parse(rest: &[&str]) -> Result<CliAction, String> {
+        parse_subagent_batch_args(rest, DEFAULT_MODEL, CliOutputFormat::Text)
+    }
+
+    #[test]
+    fn batch_requires_input_source() {
+        let err = parse(&[]).unwrap_err();
+        assert!(
+            err.contains("requires --file"),
+            "expected hint about --file/-/positional, got: {err}"
+        );
+    }
+
+    #[test]
+    fn batch_help_returns_usage() {
+        let err = parse(&["--help"]).unwrap_err();
+        assert!(err.contains("usage: claw subagent batch"), "got: {err}");
+        assert!(err.contains("--parallel"), "got: {err}");
+    }
+
+    #[test]
+    fn batch_rejects_parallel_zero() {
+        let err = parse(&["--parallel", "0", "task"]).unwrap_err();
+        assert!(err.contains(">= 1"), "got: {err}");
+    }
+
+    #[test]
+    fn batch_rejects_parallel_over_cap() {
+        let err = parse(&["--parallel", "33", "task"]).unwrap_err();
+        assert!(err.contains("<= 32"), "got: {err}");
+    }
+
+    #[test]
+    fn batch_rejects_non_numeric_parallel() {
+        let err = parse(&["--parallel", "abc", "task"]).unwrap_err();
+        assert!(err.contains("invalid --parallel"), "got: {err}");
+    }
+
+    #[test]
+    fn batch_accepts_positional_tasks() {
+        let action = parse(&["task one", "task two", "task three"]).unwrap();
+        match action {
+            CliAction::SubagentBatch {
+                tasks,
+                parallel,
+                output_format,
+                ..
+            } => {
+                assert_eq!(tasks.len(), 3);
+                assert_eq!(tasks[0], "task one");
+                assert_eq!(tasks[2], "task three");
+                assert_eq!(parallel, 4, "default parallel should be 4");
+                assert_eq!(output_format, CliOutputFormat::Text);
+            }
+            other => panic!("expected SubagentBatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn batch_reads_file_and_skips_blank_and_comment_lines() {
+        let path = std::env::temp_dir().join("claw_batch_test_tasks.txt");
+        std::fs::write(
+            &path,
+            "task A\n\n# a comment\n   # indented comment\ntask B\n\n   \ntask C\n",
+        )
+        .expect("write tmp tasks");
+        let action = parse(&["--file", path.to_str().unwrap()]).unwrap();
+        match action {
+            CliAction::SubagentBatch { tasks, .. } => {
+                assert_eq!(tasks, vec!["task A", "task B", "task C"]);
+            }
+            other => panic!("expected SubagentBatch, got {other:?}"),
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn batch_file_must_have_non_empty_tasks() {
+        let path = std::env::temp_dir().join("claw_batch_empty.txt");
+        std::fs::write(&path, "\n# only comments\n   \n").expect("write tmp");
+        let err = parse(&["--file", path.to_str().unwrap()]).unwrap_err();
+        assert!(err.contains("no non-empty"), "got: {err}");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn batch_parallel_short_flag_works() {
+        let action = parse(&["-p", "7", "task one"]).unwrap();
+        match action {
+            CliAction::SubagentBatch { parallel, .. } => assert_eq!(parallel, 7),
+            other => panic!("expected SubagentBatch, got {other:?}"),
+        }
     }
 }

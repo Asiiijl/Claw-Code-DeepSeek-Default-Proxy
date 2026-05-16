@@ -16,6 +16,7 @@
 |---|---|---|
 | **Default LLM Backend** | Anthropic Claude | **DeepSeek** (`openai/deepseek-chat`) |
 | **`subagent spawn`** | Stub / no implementation | Fully working, no `--model` needed |
+| **`subagent batch`** | — | Parallel agent cluster: dispatch N concurrent subagents from a file / stdin / args |
 | **WebSearch proxy** | No proxy support | Reads `HTTP_PROXY` / `HTTPS_PROXY` from env & config |
 | **CLI default model** | `claude-opus-4-6` | `openai/deepseek-chat` (no `--model` flag required) |
 | **Config-based proxy** | — | Loads proxy from `.claw.json` `"env"` block (Windows-safe) |
@@ -109,6 +110,36 @@ Override per-command if needed:
 ```bash
 claw --model openai/gpt-4.1-mini subagent spawn "use a different model"
 ```
+
+### 6. Use `subagent batch` — Parallel Agent Cluster (new)
+
+Dispatch many subagent tasks concurrently from the CLI. Each non-empty,
+non-`#` line of the input becomes one independent `subagent spawn` invocation.
+Concurrency is capped by `--parallel` (default `4`, hard max `32`).
+
+```bash
+# From a task file
+cat > tasks.txt <<EOF
+# lines starting with # are skipped
+Use WebSearch to find the latest RISC-V CSR spec and summarize 3 points
+Read README.md and list the top 5 missing-piece TODOs
+Run \`make sim\` in the current dir and explain any errors
+EOF
+claw subagent batch --parallel 3 --file tasks.txt
+
+# From stdin
+printf 'task A\ntask B\ntask C\n' | claw subagent batch -
+
+# As inline positional args
+claw subagent batch "task one" "task two" "task three"
+
+# JSON output for scripting / CI
+claw --output-format json subagent batch -p 4 -f tasks.txt | jq '.batch'
+```
+
+Each task's stdout/stderr/exit_code/duration is captured and printed under a
+banner like `[2/5] OK (842 ms) :: <task>`. The overall command exits non-zero
+if any task failed, so it composes cleanly with `&&` / CI pipelines.
 
 ---
 
