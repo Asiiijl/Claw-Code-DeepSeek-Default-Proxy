@@ -7,6 +7,14 @@
 > **This fork** is customized for **DeepSeek API** integration with automatic proxy support
 > and a working `subagent spawn` CLI command. Designed for users behind firewalls (China/GFW)
 > who need DuckDuckGo web search and OpenAI-compatible model access through a proxy tunnel.
+>
+> **Cooperative with [Zed Agent hack fork](https://github.com/CCChisato/Zed-Agent-Auto-Merge-Hack):**
+> Both the claw CLI and the Zed agent have been modified for **non-blocking subagent** cooperation.
+> Subagents dispatched via `claw subagent spawn` or Zed's native `spawn_agent` tool run
+> **in the background** without blocking the caller. When they complete, results are
+> automatically written to a shared notification directory (`~/.claw/sessions/notifications/`)
+> and injected into the agent's message stream on the next turn.
+> **No human approval needed** — all tool permissions are auto-granted.
 
 ---
 
@@ -305,30 +313,60 @@ streaming responses. This fork properly:
 
 ## 🧩 Code Changes Summary
 
-### `rust/crates/api/src/http_client.rs`
+### Non-Blocking Subagent System (`rust/crates/rusty-claude-cli/src/main.rs`)
+
+#### `subagent spawn` — Detached Background Process
+- Replaced `std::thread::spawn` (killed on Windows when parent exits) with **detached child process**
+- Uses `CREATE_DETACHED_PROCESS` flag on Windows to break out of the parent's Job Object
+- Child runs `claw --compact --output-format json prompt <msg>` independently
+- Environment variable `CLAW_SUBAGENT_SESSION_ID` is passed to the child so it auto-writes completion
+
+#### Structured Report (`##SUBAGENT_REPORT##`)
+- On spawn, the prompt is automatically appended with formatting instructions
+- Subagent is asked to output a `##SUBAGENT_REPORT##` section at the end
+- `claw subagent status` parses the JSONL session dump to extract the report
+- Default view shows structured fields: `task`, `status`, `summary`, `key_findings`, `raw_output`
+- `claw subagent status --full` shows raw JSONL
+
+#### Notification Directory
+- On completion, writes `~/.claw/sessions/notifications/<id>.notification.json`
+- Contains the parsed report for cooperative consumption by the Zed agent
+
+#### `subagent status` Improvements
+- `--output-format json` now includes a `report` field with parsed structured data
+- `--full` flag shows the original completion JSON instead of the parsed report
+- `--raw` / `--no-summary` on spawn skips appending the `##SUBAGENT_REPORT##` instruction
+
+#### Auto-Detached Process (Windows Fix)
+- Parent process exits immediately after printing session_id
+- Child process survives independently via `DETACHED_PROCESS` creation flag
+- PID is recorded in `.meta.json` for process inspection
+
+### Proxy & DeepSeek Integration
+
+#### `rust/crates/api/src/http_client.rs`
 - Added `build_blocking_http_client_with()` — shared proxy logic for blocking (sync) clients
 - Added `ProxyBuilder` trait to abstract proxy injection over `ClientBuilder` + `blocking::ClientBuilder`
 - Sets 20s timeout, redirect limit, and user-agent
 
-### `rust/crates/api/Cargo.toml`
+#### `rust/crates/api/Cargo.toml`
 - Added `blocking` feature to `reqwest` dependency
 
-### `rust/crates/tools/src/lib.rs`
+#### `rust/crates/tools/src/lib.rs`
 - `build_http_client()` now delegates to `api::build_blocking_http_client_with(api::ProxyConfig::from_env())`
-- Removed duplicate proxy-reading code (was reading env vars independently, missing `NO_PROXY` and `.no_proxy()`)
+- Removed duplicate proxy-reading code
 
-### `rust/crates/rusty-claude-cli/src/main.rs`
+#### `rust/crates/rusty-claude-cli/src/main.rs`
 - **Default model changed** from `claude-opus-4-6` to `openai/deepseek-chat` — no `--model` flag needed
 - Added **config bootstrap** in `run()` — loads proxy from `.claw.json` `"env"` block before network
-- `parse_args()`: `"subagent"` match arm with `spawn`/`list`/`steer` subcommands
+- `parse_args()`: `"subagent"` match arm with `spawn`/`status`/`list`/`steer`/`batch` subcommands
 - `detect_subagent_model_from_env()`: auto-detects DeepSeek when `OPENAI_BASE_URL` + `OPENAI_API_KEY` are set
-- Removed duplicate function definitions (cleanup)
 
-### `rust/crates/api/src/providers/openai_compat.rs`
-- `wire_model_for_base_url()`: strips `openai/` prefix for DeepSeek base URL (which rejects prefixed model names)
+#### `rust/crates/api/src/providers/openai_compat.rs`
+- `wire_model_for_base_url()`: strips `openai/` prefix for DeepSeek base URL
 
-### `.claw.json`
-- Added `"env"` block with proxy configuration consumed by the config bootstrap
+#### `.claw.json`
+- Added `"env"` block with proxy configuration
 
 ---
 
