@@ -1478,7 +1478,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let start = Instant::now();
 
             let prompt_result = (|| -> Result<(), Box<dyn std::error::Error>> {
-                let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+                let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode, false)?;
                 cli.set_reasoning_effort(reasoning_effort);
                 cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
 
@@ -1566,6 +1566,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             model,
             allowed_tools,
             permission_mode,
+            auto_approve,
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
@@ -1573,6 +1574,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             model,
             allowed_tools,
             permission_mode,
+            auto_approve,
             base_commit,
             reasoning_effort,
             allow_broad_cwd,
@@ -1715,6 +1717,7 @@ enum CliAction {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        auto_approve: bool,
         base_commit: Option<String>,
         reasoning_effort: Option<String>,
         allow_broad_cwd: bool,
@@ -1822,6 +1825,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
     let mut model_flag_raw: Option<String> = None;
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode_override = None;
+    let mut auto_approve = false;
     let mut wants_help = false;
     let mut wants_version = false;
     let mut allowed_tool_values = Vec::new();
@@ -1897,6 +1901,10 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             }
             "--dangerously-skip-permissions" => {
                 permission_mode_override = Some(PermissionMode::DangerFullAccess);
+                index += 1;
+            }
+            "--auto-approve" => {
+                auto_approve = true;
                 index += 1;
             }
             "--compact" => {
@@ -2040,6 +2048,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             model,
             allowed_tools,
             permission_mode,
+            auto_approve,
             base_commit,
             reasoning_effort: reasoning_effort.clone(),
             allow_broad_cwd,
@@ -5388,6 +5397,7 @@ fn run_resume_command(
         | SlashCommand::Fast
         | SlashCommand::Exit
         | SlashCommand::Summary
+        | SlashCommand::AutoApprove { .. }
         | SlashCommand::Desktop
         | SlashCommand::Brief
         | SlashCommand::Advisor
@@ -5532,6 +5542,7 @@ fn run_repl(
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    auto_approve: bool,
     base_commit: Option<String>,
     reasoning_effort: Option<String>,
     allow_broad_cwd: bool,
@@ -5539,7 +5550,7 @@ fn run_repl(
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
-    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode)?;
+    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode, auto_approve)?;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
@@ -5618,6 +5629,7 @@ struct LiveCli {
     model: String,
     allowed_tools: Option<AllowedToolSet>,
     permission_mode: PermissionMode,
+    auto_approve: bool,
     system_prompt: Vec<String>,
     runtime: BuiltRuntime,
     session: SessionHandle,
@@ -6113,6 +6125,7 @@ impl LiveCli {
         enable_tools: bool,
         allowed_tools: Option<AllowedToolSet>,
         permission_mode: PermissionMode,
+        auto_approve: bool,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let system_prompt = build_system_prompt(&model)?;
         let session_state = new_cli_session()?;
@@ -6132,6 +6145,7 @@ impl LiveCli {
             model,
             allowed_tools,
             permission_mode,
+            auto_approve,
             system_prompt,
             runtime,
             session,
@@ -6240,6 +6254,7 @@ impl LiveCli {
             &mut stdout,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        permission_prompter.set_auto_approve(self.auto_approve);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         match result {
@@ -6250,6 +6265,7 @@ impl LiveCli {
                     TerminalRenderer::new().color_theme(),
                     &mut stdout,
                 )?;
+                print_turn_summary(&summary);
                 let final_text = final_assistant_text(&summary);
                 if !final_text.is_empty() {
                     println!("{final_text}");
@@ -6293,6 +6309,7 @@ impl LiveCli {
     fn run_prompt_compact(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        permission_prompter.set_auto_approve(self.auto_approve);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         let summary = result?;
@@ -6306,6 +6323,7 @@ impl LiveCli {
     fn run_prompt_compact_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        permission_prompter.set_auto_approve(self.auto_approve);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         let summary = result?;
@@ -6331,6 +6349,7 @@ impl LiveCli {
     fn run_prompt_json(&mut self, input: &str) -> Result<(), Box<dyn std::error::Error>> {
         let (mut runtime, hook_abort_monitor) = self.prepare_turn_runtime(false)?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        permission_prompter.set_auto_approve(self.auto_approve);
         let result = runtime.run_turn(input, Some(&mut permission_prompter));
         hook_abort_monitor.stop();
         let summary = result?;
@@ -6499,7 +6518,6 @@ impl LiveCli {
             | SlashCommand::Files
             | SlashCommand::Fast
             | SlashCommand::Exit
-            | SlashCommand::Summary
             | SlashCommand::Desktop
             | SlashCommand::Brief
             | SlashCommand::Advisor
@@ -6532,6 +6550,28 @@ impl LiveCli {
                 eprintln!("{cmd_name} is not yet implemented in this build.");
                 false
             }
+            SlashCommand::Summary => {
+                self.print_session_summary();
+                false
+            }
+            SlashCommand::AutoApprove { enabled } => {
+                match enabled {
+                    Some(true) => {
+                        self.auto_approve = true;
+                        println!("✅ Auto-approve mode enabled - all tool calls will be automatically approved.");
+                    }
+                    Some(false) => {
+                        self.auto_approve = false;
+                        println!("✅ Auto-approve mode disabled - you will be prompted for tool calls.");
+                    }
+                    None => {
+                        self.auto_approve = !self.auto_approve;
+                        let status = if self.auto_approve { "enabled" } else { "disabled" };
+                        println!("✅ Auto-approve mode toggled {status}.");
+                    }
+                }
+                false
+            }
             SlashCommand::Unknown(name) => {
                 eprintln!("{}", format_unknown_slash_command(&name));
                 false
@@ -6542,6 +6582,74 @@ impl LiveCli {
     fn persist_session(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.runtime.session().save_to_path(&self.session.path)?;
         Ok(())
+    }
+
+    fn print_session_summary(&self) {
+        let session = self.runtime.session();
+        let usage = self.runtime.usage().cumulative_usage();
+        let tool_uses: Vec<String> = session
+            .messages
+            .iter()
+            .filter(|msg| msg.role == runtime::MessageRole::Assistant)
+            .flat_map(|msg| msg.blocks.iter())
+            .filter_map(|block| match block {
+                runtime::ContentBlock::ToolUse { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect();
+
+        let tool_count = tool_uses.len();
+        let file_ops: Vec<&String> = tool_uses.iter().filter(|t| {
+            matches!(t.as_str(), "read_file" | "write_file" | "edit_file" | "file_edit" | "glob_search" | "grep_search")
+        }).collect();
+        let bash_ops: Vec<&String> = tool_uses.iter().filter(|t| t.as_str() == "bash").collect();
+        let web_ops: Vec<&String> = tool_uses.iter().filter(|t| {
+            matches!(t.as_str(), "WebSearch" | "WebFetch")
+        }).collect();
+
+        let last_text = session.messages.iter().rev()
+            .filter(|msg| msg.role == runtime::MessageRole::Assistant)
+            .flat_map(|msg| msg.blocks.iter())
+            .filter_map(|block| match block {
+                runtime::ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .next()
+            .unwrap_or_default();
+
+        let summary_text = if last_text.len() > 300 {
+            format!("{}...", &last_text[..300])
+        } else {
+            last_text.clone()
+        };
+
+        println!();
+        println!("╭─ 📋 Session Summary ");
+        println!("│");
+        println!("│  Messages:        {} ({} user, {} assistant)",
+            session.messages.len(),
+            session.messages.iter().filter(|m| m.role == runtime::MessageRole::User).count(),
+            session.messages.iter().filter(|m| m.role == runtime::MessageRole::Assistant).count(),
+        );
+        println!("│  Tool calls:      {}", tool_count);
+        println!("│    ├─ File ops:   {}", file_ops.len());
+        println!("│    ├─ Bash:       {}", bash_ops.len());
+        println!("│    └─ Web:        {}", web_ops.len());
+        println!("│  Tokens:          {} in / {} out / {} cache",
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.cache_read_input_tokens + usage.cache_creation_input_tokens,
+        );
+        println!("│  Auto-approve:    {}", if self.auto_approve { "✅ ON" } else { "❌ OFF" });
+        if !summary_text.is_empty() {
+            println!("│");
+            println!("│  Last response:");
+            for line in summary_text.lines().take(5) {
+                println!("│    {line}");
+            }
+        }
+        println!("╰─");
+        println!();
     }
 
     fn print_status(&self) {
@@ -7138,6 +7246,7 @@ impl LiveCli {
             progress,
         )?;
         let mut permission_prompter = CliPermissionPrompter::new(self.permission_mode);
+        permission_prompter.set_auto_approve(self.auto_approve);
         let summary = runtime.run_turn(prompt, Some(&mut permission_prompter))?;
         let text = final_assistant_text(&summary).trim().to_string();
         runtime.shutdown_plugins()?;
@@ -9778,11 +9887,20 @@ impl runtime::HookProgressReporter for CliHookProgressReporter {
 
 struct CliPermissionPrompter {
     current_mode: PermissionMode,
+    auto_approve: bool,
 }
 
 impl CliPermissionPrompter {
     fn new(current_mode: PermissionMode) -> Self {
-        Self { current_mode }
+        Self {
+            current_mode,
+            auto_approve: false,
+        }
+    }
+
+    /// Enable automatic approval of all tool calls
+    fn set_auto_approve(&mut self, enabled: bool) {
+        self.auto_approve = enabled;
     }
 }
 
@@ -9791,6 +9909,11 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
         &mut self,
         request: &runtime::PermissionRequest,
     ) -> runtime::PermissionPromptDecision {
+        // Auto-approve mode: skip all permission prompts
+        if self.auto_approve {
+            return runtime::PermissionPromptDecision::Allow;
+        }
+
         println!();
         println!("Permission approval required");
         println!("  Tool             {}", request.tool_name);
@@ -10299,6 +10422,120 @@ fn collect_tool_results(summary: &runtime::TurnSummary) -> Vec<serde_json::Value
             _ => None,
         })
         .collect()
+}
+
+/// Print a concise summary of the completed turn, showing tools used
+/// and key results. This is called automatically after each turn when
+/// auto-approve mode is active (since there's no interactive prompt feedback).
+fn print_turn_summary(summary: &runtime::TurnSummary) {
+    struct ToolCallDisplay {
+        name: String,
+        input: String,
+    }
+    struct ToolResultDisplay {
+        name: String,
+        output: String,
+        is_error: bool,
+    }
+
+    let tool_uses: Vec<ToolCallDisplay> = summary
+        .assistant_messages
+        .iter()
+        .flat_map(|msg| msg.blocks.iter())
+        .filter_map(|block| match block {
+            runtime::ContentBlock::ToolUse { name, input, .. } => {
+                let input_str = serde_json::to_string(input).unwrap_or_default();
+                let display = if input_str.len() > 80 {
+                    format!("{}...", &input_str[..80])
+                } else {
+                    input_str
+                };
+                Some(ToolCallDisplay {
+                    name: name.clone(),
+                    input: display,
+                })
+            }
+            _ => None,
+        })
+        .collect();
+
+    let tool_results: Vec<ToolResultDisplay> = summary
+        .tool_results
+        .iter()
+        .flat_map(|msg| msg.blocks.iter())
+        .filter_map(|block| match block {
+            runtime::ContentBlock::ToolResult { tool_name, output, is_error, .. } => {
+                let display = if output.len() > 100 {
+                    format!("{}...", &output[..100])
+                } else {
+                    output.clone()
+                };
+                Some(ToolResultDisplay {
+                    name: tool_name.clone(),
+                    output: display,
+                    is_error: *is_error,
+                })
+            }
+            _ => None,
+        })
+        .collect();
+
+    if tool_uses.is_empty() && tool_results.is_empty() {
+        return;
+    }
+
+    println!();
+    println!("╭─ 🔄 Turn Summary ({} iterations)", summary.iterations);
+
+    if !tool_uses.is_empty() {
+        println!("│");
+        println!("│  Tools called:");
+        for tc in &tool_uses {
+            println!("│    🛠  {}({})", tc.name, tc.input);
+        }
+    }
+
+    let errors: Vec<&ToolResultDisplay> = tool_results.iter().filter(|tr| tr.is_error).collect();
+    if !errors.is_empty() {
+        println!("│");
+        println!("│  \u{26a0}\u{fe0f}  Errors:");
+        for tr in &errors {
+            println!("│    \u{274c} {}: {}", tr.name, tr.output);
+        }
+    }
+
+    let last_text = summary
+        .assistant_messages
+        .last()
+        .map(|msg| {
+            msg.blocks
+                .iter()
+                .filter_map(|block| match block {
+                    runtime::ContentBlock::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default();
+
+    if !last_text.is_empty() {
+        let summary_line = last_text.lines().next().unwrap_or("");
+        let truncated = if summary_line.len() > 120 {
+            format!("{}...", &summary_line[..120])
+        } else {
+            summary_line.to_string()
+        };
+        println!("│");
+        println!("│  Response: {truncated}");
+    }
+
+    if !tool_uses.is_empty() {
+        println!("│");
+        println!("│  \u{1f4a1} Tip: Use /summary for full session overview");
+    }
+    println!("╰─");
+    println!();
 }
 
 fn collect_prompt_cache_events(summary: &runtime::TurnSummary) -> Vec<serde_json::Value> {
@@ -11339,7 +11576,8 @@ fn print_help_to(out: &mut impl Write) -> io::Result<()> {
     )?;
     writeln!(
         out,
-        "  --dangerously-skip-permissions  Skip all permission checks"
+        "  --auto-approve                   Automatically approve all tool calls (no prompts)
+  --dangerously-skip-permissions  Skip all permission checks"
     )?;
     writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
     writeln!(
@@ -14072,6 +14310,7 @@ mod tests {
                 true,
                 None,
                 PermissionMode::DangerFullAccess,
+                false,
             )
             .expect("cli should initialize")
             .startup_banner()
