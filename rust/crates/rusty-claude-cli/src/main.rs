@@ -18,6 +18,13 @@ use std::net::TcpListener;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+
+#[cfg(target_os = "windows")]
+use std::os::windows::process::CommandExt;
+
+#[cfg(target_os = "windows")]
+const DETACHED_PROCESS: u32 = 0x00000008;
+
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -171,6 +178,11 @@ const OFFICIAL_REPO_SLUG: &str = "ultraworkers/claw-code";
 const DEPRECATED_INSTALL_COMMAND: &str = "cargo install claw-code";
 const LATEST_SESSION_REFERENCE: &str = "latest";
 const SESSION_REFERENCE_ALIASES: &[&str] = &[LATEST_SESSION_REFERENCE, "last", "recent"];
+
+/// Format instruction automatically appended to subagent prompts (unless
+/// `--raw` / `--no-summary` is specified). Instructs the subagent to
+/// produce a structured machine-readable summary at the end of its output.
+const SUBAGENT_REPORT_SUFFIX: &str = "\n\n（在此 prompt 的最后，请用以下格式输出一份任务摘要，方便调用方快速了解结果：\n\n##SUBAGENT_REPORT##\n- task: <原始任务描述>\n- status: <success/partial/failed>\n- summary: <任务结果的一句话总结>\n- key_findings: <关键发现，最多3点>\n- raw_output: <如有需要输出的原始数据>\n）\n\n请先执行任务，然后在最后附上上述格式的摘要。\n";
 const CLI_OPTION_SUGGESTIONS: &[&str] = &[
     "--help",
     "-h",
@@ -601,6 +613,495 @@ fn subagent_batch_run(
     Ok(if failed == 0 { 0 } else { 1 })
 }
 
+// ---------------------------------------------------------------------------
+// Subagent spawn / status / list helpers
+// ---------------------------------------------------------------------------
+
+/// Return the path to the live subagents directory (`~/.claw/sessions/live/`).
+fn subagent_live_dir() -> std::io::Result<PathBuf> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    let dir = PathBuf::from(home)
+        .join(".claw")
+        .join("sessions")
+        .join("live");
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Handle `claw subagent spawn <prompt>` — dispatch the prompt to a detached
+/// background process and return the session_id immediately.
+///
+/// We spawn a detached child process (not a thread) because the main process
+/// exits immediately after printing the session_id, and on Windows any
+/// background threads are killed when the main thread exits.
+///
+/// The child process is invoked as:
+///   CLAW_SUBAGENT_SESSION_ID=<id> claw --model <model> prompt <prompt>
+///
+/// After the prompt completes, the child detects the env var and automatically
+/// writes the completion file (see `run()` → `CliAction::Prompt`).
+fn handle_subagent_spawn(
+    prompt: String,
+    model: String,
+    output_format: CliOutputFormat,
+    session_id: String,
+    no_summary: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let live_dir = subagent_live_dir()?;
+    let meta_path = live_dir.join(format!("{session_id}.meta.json"));
+
+    // Write meta file so `subagent list` can see this as "running"
+    let meta = serde_json::json!({
+        "session_id": session_id,
+        "status": "running",
+        "prompt": prompt,
+        "model": model,
+        "started_at_ms": current_timestamp_ms(),
+    });
+    fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
+
+    // Get the current executable path for the child process
+    let exe =
+        std::env::current_exe().map_err(|e| format!("failed to get current exe path: {e}"))?;
+
+    // Build the effective prompt: optionally append the subagent report
+    // formatting instruction so the subagent structures its output for
+    // machine consumption by the calling agent.
+    let effective_prompt = if no_summary {
+        prompt.clone()
+    } else {
+        format!("{}{}", prompt, SUBAGENT_REPORT_SUFFIX)
+    };
+
+    // Spawn a detached child process that runs the prompt.
+    // The child inherits the parent's environment plus CLAW_SUBAGENT_SESSION_ID
+    // so it can write the completion file when done.
+    //
+    // We use --compact --output-format json to avoid spinner/tty issues
+    // in the background process (stdout is not a terminal).
+    // stdin is null so the process can't block on user input.
+    //
+    // On Windows we MUST use DETACHED_PROCESS creation flags. Without this,
+    // the child process is bound to the parent's job object and gets killed
+    // when the parent (claw subagent spawn) exits.
+    let mut cmd = Command::new(&exe);
+    cmd.arg("--dangerously-skip-permissions")
+        .arg("--compact")
+        .arg("--output-format")
+        .arg("json")
+        .arg("--model")
+        .arg(&model)
+        .arg("prompt")
+        .arg(&effective_prompt)
+        .env("CLAW_SUBAGENT_SESSION_ID", &session_id)
+        .stdin(std::process::Stdio::null());
+
+    #[cfg(target_os = "windows")]
+    {
+        cmd.creation_flags(DETACHED_PROCESS);
+    }
+
+    let child = cmd.spawn();
+
+    match child {
+        Ok(child) => {
+            let pid = child.id();
+            // Update meta with PID
+            if let Ok(meta_data) = fs::read_to_string(&meta_path) {
+                if let Ok(mut meta_val) = serde_json::from_str::<serde_json::Value>(&meta_data) {
+                    meta_val["pid"] = serde_json::json!(pid);
+                    if let Ok(json_str) = serde_json::to_string_pretty(&meta_val) {
+                        let _ = fs::write(&meta_path, json_str);
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            let _ = write_subagent_completion(
+                &live_dir,
+                &session_id,
+                "error",
+                "",
+                &format!("failed to spawn child process: {e}"),
+                Duration::ZERO,
+            );
+        }
+    }
+
+    // Print the session_id immediately (non-blocking)
+    if matches!(output_format, CliOutputFormat::Json) {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "type": "subagent_dispatched",
+                "session_id": session_id,
+            }))?
+        );
+    } else {
+        println!("[subagent dispatched] session_id={session_id}");
+        println!("Use `claw subagent status {session_id}` to check results");
+    }
+
+    Ok(())
+}
+
+/// Write the `.completed.json` file and remove the `.meta.json` so the agent
+/// shows as "completed" (instead of "running").
+///
+/// Also writes a notification file to `<home>/.claw/sessions/notifications/`
+/// so that the Zed `check_subagent_status` tool can detect completions
+/// without polling every `.completed.json` individually.
+fn write_subagent_completion(
+    live_dir: &Path,
+    session_id: &str,
+    status: &str,
+    stdout: &str,
+    stderr: &str,
+    elapsed: Duration,
+) -> std::io::Result<()> {
+    // Parse the ##SUBAGENT_REPORT## from output for the notification
+    let report = parse_subagent_report(stdout);
+    let completed = serde_json::json!({
+        "session_id": session_id,
+        "status": status,
+        "output": stdout,
+        "error": stderr,
+        "duration_ms": elapsed.as_millis(),
+        "completed_at_ms": current_timestamp_ms(),
+    });
+    let completed_path = live_dir.join(format!("{session_id}.completed.json"));
+    fs::write(&completed_path, serde_json::to_string_pretty(&completed)?)?;
+
+    // Write notification file for cooperation with Zed agent
+    let notification_dir = notifications_dir();
+    if let Ok(notif_dir) = notification_dir {
+        let notification = serde_json::json!({
+            "session_id": session_id,
+            "status": status,
+            "duration_ms": elapsed.as_millis(),
+            "completed_at_ms": current_timestamp_ms(),
+            "report": report,
+            "error": if stderr.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(stderr.to_string()) },
+        });
+        let notif_path = notif_dir.join(format!("{session_id}.notification.json"));
+        let _ = fs::write(&notif_path, serde_json::to_string_pretty(&notification)?);
+    }
+
+    // Remove the meta file to indicate completion
+    let meta_path = live_dir.join(format!("{session_id}.meta.json"));
+    let _ = fs::remove_file(&meta_path);
+    Ok(())
+}
+
+/// Return the path to the notifications directory used for cooperative task
+/// completion notifications between claw subagents and the Zed agent.
+/// Location: `<home>/.claw/sessions/notifications/`
+fn notifications_dir() -> std::io::Result<PathBuf> {
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .unwrap_or_else(|_| ".".to_string());
+    let dir = PathBuf::from(home)
+        .join(".claw")
+        .join("sessions")
+        .join("notifications");
+    fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Parse the `##SUBAGENT_REPORT##` section from raw completion output
+/// (which is a JSONL session dump). Returns `None` if the section is
+/// not found or cannot be parsed.
+fn parse_subagent_report(output_jsonl: &str) -> Option<serde_json::Value> {
+    // Walk lines in reverse to find the last assistant message block
+    // that contains ##SUBAGENT_REPORT##
+    //
+    // The JSONL format is: {"message":{"blocks":[{"text":"...","type":"text"}],"role":"assistant"}}
+    // or: {"blocks":[{"text":"..."}],"role":"assistant"}
+    for line in output_jsonl.lines().rev() {
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+            // Check role at top level or inside "message"
+            let role = val
+                .get("role")
+                .or_else(|| val.get("message").and_then(|m| m.get("role")))
+                .and_then(|r| r.as_str());
+            if role == Some("assistant") {
+                // Get blocks from top level or inside "message"
+                let blocks = val
+                    .get("blocks")
+                    .or_else(|| val.get("message").and_then(|m| m.get("blocks")))
+                    .and_then(|b| b.as_array());
+                if let Some(blocks) = blocks {
+                    for block in blocks.iter().rev() {
+                        if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                            if let Some(report_start) = text.find("##SUBAGENT_REPORT##") {
+                                let after_header =
+                                    &text[report_start + "##SUBAGENT_REPORT##".len()..];
+                                // Try to parse the remainder as key-value pairs.
+                                // Supports both "key: value" and "- key: value" (markdown list)
+                                // formats, and multi-line values (indented lines following a key).
+                                let mut report = serde_json::Map::new();
+                                let mut current_key: Option<String> = None;
+                                let mut current_value = String::new();
+
+                                fn flush_report_entry(
+                                    report: &mut serde_json::Map<String, serde_json::Value>,
+                                    key: &str,
+                                    value: &str,
+                                ) {
+                                    // Normalize key: strip leading "- " and trim
+                                    let key = key
+                                        .trim_start_matches("- ")
+                                        .trim_start_matches('-')
+                                        .trim()
+                                        .to_lowercase()
+                                        .replace(' ', "_");
+                                    let value = value.trim().to_string();
+                                    if !key.is_empty() && !value.is_empty() {
+                                        report.insert(key, serde_json::Value::String(value));
+                                    }
+                                }
+
+                                for report_line in after_header.lines() {
+                                    if report_line.trim().is_empty() {
+                                        continue;
+                                    }
+                                    if let Some((key, value)) = report_line.split_once(':') {
+                                        // Flush previous entry
+                                        if let Some(ref k) = current_key {
+                                            flush_report_entry(&mut report, k, &current_value);
+                                        }
+                                        current_key = Some(key.to_string());
+                                        current_value = value.to_string();
+                                    } else if current_key.is_some() {
+                                        // Continuation of previous value (multi-line)
+                                        current_value.push(' ');
+                                        current_value.push_str(report_line.trim());
+                                    }
+                                }
+                                // Flush last entry
+                                if let Some(ref k) = current_key {
+                                    flush_report_entry(&mut report, k, &current_value);
+                                }
+
+                                if !report.is_empty() {
+                                    return Some(serde_json::Value::Object(report));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Handle `claw subagent status <session_id>`
+///
+/// By default (when `full` is false), this function:
+/// 1. Reads the `.completed.json` file
+/// 2. Parses the `output` field as JSONL to find the last assistant message
+/// 3. Extracts the `##SUBAGENT_REPORT##` section from it
+/// 4. Shows only the structured report (concise mode)
+///
+/// If no report is found, or `full` is true, falls back to showing the
+/// complete JSON output.
+fn handle_subagent_status(
+    session_id: &str,
+    output_format: CliOutputFormat,
+    full: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let live_dir = subagent_live_dir()?;
+
+    // Check completed first
+    let completed_path = live_dir.join(format!("{session_id}.completed.json"));
+    if let Ok(data) = fs::read_to_string(&completed_path) {
+        let value: serde_json::Value = serde_json::from_str(&data)?;
+        let status = value["status"].as_str().unwrap_or("unknown");
+        let output = value["output"].as_str().unwrap_or("");
+        let error = value["error"].as_str().unwrap_or("");
+        let dur = value["duration_ms"].as_u64().unwrap_or(0);
+
+        if matches!(output_format, CliOutputFormat::Json) {
+            // JSON mode: if not --full, try to augment with parsed report
+            if !full {
+                if let Some(report) = parse_subagent_report(output) {
+                    let mut augmented = serde_json::json!({
+                        "session_id": session_id,
+                        "status": status,
+                        "duration_ms": dur,
+                        "completed_at_ms": value["completed_at_ms"],
+                        "report": report,
+                    });
+                    if !error.is_empty() {
+                        augmented["error"] = serde_json::Value::String(error.to_string());
+                    }
+                    println!("{}", serde_json::to_string_pretty(&augmented)?);
+                    return Ok(());
+                }
+            }
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            // Text mode
+            if !full {
+                // Try to extract and show the structured report
+                if let Some(report) = parse_subagent_report(output) {
+                    println!("[subagent {session_id}] status={status} duration={dur}ms");
+                    println!("--- subagent report ---");
+                    if let Some(task) = report.get("task").and_then(|v| v.as_str()) {
+                        println!("  task: {task}");
+                    }
+                    if let Some(s) = report.get("status").and_then(|v| v.as_str()) {
+                        println!("  status: {s}");
+                    }
+                    if let Some(summary) = report.get("summary").and_then(|v| v.as_str()) {
+                        println!("  summary: {summary}");
+                    }
+                    if let Some(findings) = report.get("key_findings").and_then(|v| v.as_str()) {
+                        println!("  key_findings: {findings}");
+                    }
+                    if let Some(raw) = report.get("raw_output").and_then(|v| v.as_str()) {
+                        if !raw.is_empty() {
+                            println!("  raw_output:");
+                            println!("{raw}");
+                        }
+                    }
+                    if !error.is_empty() {
+                        println!("--- error ---");
+                        println!("{error}");
+                    }
+                    println!("(Use `claw subagent status {session_id} --full` for full output)");
+                    return Ok(());
+                }
+            }
+
+            // Fallback: show full completion info
+            println!("[subagent {session_id}] status={status} duration={dur}ms");
+            if !output.is_empty() {
+                println!("--- output ---");
+                println!("{output}");
+            }
+            if !error.is_empty() {
+                println!("--- error ---");
+                println!("{error}");
+            }
+        }
+        return Ok(());
+    }
+
+    // Check meta (still running)
+    let meta_path = live_dir.join(format!("{session_id}.meta.json"));
+    if let Ok(data) = fs::read_to_string(&meta_path) {
+        let value: serde_json::Value = serde_json::from_str(&data)?;
+        if matches!(output_format, CliOutputFormat::Json) {
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            let started_ms = value["started_at_ms"].as_u64().unwrap_or(0);
+            println!("[subagent {session_id}] status=running started_at_ms={started_ms}");
+            println!("Not yet completed. Retry with `claw subagent status {session_id}` later.");
+        }
+        return Ok(());
+    }
+
+    // Not found
+    if matches!(output_format, CliOutputFormat::Json) {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "type": "subagent_not_found",
+                "session_id": session_id,
+            }))?
+        );
+    } else {
+        println!("[subagent {session_id}] not found");
+    }
+    Ok(())
+}
+
+/// Handle `claw subagent list`
+fn handle_subagent_list(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::Error>> {
+    let live_dir = subagent_live_dir()?;
+
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+
+    // 1) Running agents (meta files without completed.json)
+    if let Ok(rd) = fs::read_dir(&live_dir) {
+        for entry in rd.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if !name_str.ends_with(".meta.json") {
+                continue;
+            }
+            let session_id = name_str.trim_end_matches(".meta.json").to_string();
+            // Only list if no completed.json exists
+            let completed_path = live_dir.join(format!("{session_id}.completed.json"));
+            if completed_path.exists() {
+                // Load completed instead
+                if let Ok(data) = fs::read_to_string(&completed_path) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                        entries.push(v);
+                    }
+                }
+            } else {
+                // Still running
+                if let Ok(data) = fs::read_to_string(&entry.path()) {
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                        entries.push(v);
+                    }
+                }
+            }
+        }
+    }
+
+    // Deduplicate: prefer completed over meta (they may have same session_id)
+    entries.sort_by(|a, b| {
+        let a_id = a["session_id"].as_str().unwrap_or("");
+        let b_id = b["session_id"].as_str().unwrap_or("");
+        a_id.cmp(b_id)
+    });
+    entries.dedup_by(|a, b| a["session_id"].as_str() == b["session_id"].as_str());
+
+    if matches!(output_format, CliOutputFormat::Json) {
+        let list: Vec<&serde_json::Value> = entries.iter().collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "subagents": list,
+                "count": entries.len(),
+            }))?
+        );
+    } else {
+        if entries.is_empty() {
+            println!("No subagent sessions found.");
+            return Ok(());
+        }
+        println!("Subagent sessions:");
+        for entry in &entries {
+            let sid = entry["session_id"].as_str().unwrap_or("?");
+            let status = entry["status"].as_str().unwrap_or("unknown");
+            let prompt = entry["prompt"].as_str().unwrap_or("");
+            let model = entry["model"].as_str().unwrap_or("?");
+            let short_prompt = if prompt.len() > 60 {
+                format!("{}...", &prompt[..57])
+            } else {
+                prompt.to_string()
+            };
+            println!("  {sid} [{status}] model={model} \"{short_prompt}\"");
+        }
+    }
+    Ok(())
+}
+
+/// Return the current Unix epoch time in milliseconds.
+fn current_timestamp_ms() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 /// Read piped stdin content when stdin is not a terminal.
 ///
 /// Returns `None` when stdin is attached to a terminal (interactive REPL use),
@@ -796,9 +1297,55 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 None
             };
             let effective_prompt = merge_prompt_with_stdin(&prompt, stdin_context.as_deref());
-            let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
-            cli.set_reasoning_effort(reasoning_effort);
-            cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
+            let subagent_session_id = std::env::var("CLAW_SUBAGENT_SESSION_ID").ok();
+            let start = Instant::now();
+
+            let prompt_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+                let mut cli = LiveCli::new(model, true, allowed_tools, permission_mode)?;
+                cli.set_reasoning_effort(reasoning_effort);
+                cli.run_turn_with_output(&effective_prompt, output_format, compact)?;
+
+                // If we were spawned as a subagent child process, write
+                // the completion file with the session output.
+                if let Some(ref sid) = subagent_session_id {
+                    let sid = sid.trim();
+                    if !sid.is_empty() {
+                        let output_text =
+                            std::fs::read_to_string(&cli.session.path).unwrap_or_default();
+                        if let Ok(live_dir) = subagent_live_dir() {
+                            let _ = write_subagent_completion(
+                                &live_dir,
+                                sid,
+                                "completed",
+                                &output_text,
+                                "",
+                                start.elapsed(),
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            })();
+
+            // If prompt failed and we are a subagent, write error completion.
+            if let Err(e) = prompt_result {
+                if let Some(ref sid) = subagent_session_id {
+                    let sid = sid.trim();
+                    if !sid.is_empty() {
+                        if let Ok(live_dir) = subagent_live_dir() {
+                            let _ = write_subagent_completion(
+                                &live_dir,
+                                sid,
+                                "failed",
+                                "",
+                                &format!("subagent prompt failed: {e}"),
+                                start.elapsed(),
+                            );
+                        }
+                    }
+                }
+                return Err(e);
+            }
         }
         CliAction::Doctor { output_format } => run_doctor(output_format)?,
         CliAction::Acp { output_format } => print_acp_status(output_format)?,
@@ -858,6 +1405,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
         } => print_help_topic(topic, output_format)?,
         CliAction::Help { output_format } => print_help(output_format)?,
+        CliAction::SubagentSpawn {
+            prompt,
+            model,
+            output_format,
+            session_id,
+            no_summary,
+        } => handle_subagent_spawn(prompt, model, output_format, session_id, no_summary)?,
+        CliAction::SubagentStatus {
+            session_id,
+            output_format,
+            full,
+        } => handle_subagent_status(&session_id, output_format, full)?,
+        CliAction::SubagentList { output_format } => handle_subagent_list(output_format)?,
         CliAction::SubagentBatch {
             tasks,
             parallel,
@@ -977,6 +1537,37 @@ enum CliAction {
     },
     // prompt-mode formatting is only supported for non-interactive runs
     Help {
+        output_format: CliOutputFormat,
+    },
+    /// Non-blocking subagent spawn: returns immediately with a session_id.
+    /// The actual prompt runs in a background thread and writes results
+    /// to `.claw/sessions/live/<session_id>.completed.json` when done.
+    ///
+    /// By default, the prompt is augmented with a `##SUBAGENT_REPORT##`
+    /// formatting instruction so the subagent structures its output for
+    /// machine consumption. Pass `--raw` to suppress this augmentation.
+    SubagentSpawn {
+        prompt: String,
+        model: String,
+        output_format: CliOutputFormat,
+        session_id: String,
+        /// If true, skip appending the `##SUBAGENT_REPORT##` formatting
+        /// instruction to the prompt.
+        no_summary: bool,
+    },
+    /// Check status / read results of a previously spawned subagent.
+    /// When the subagent completed and its output contains a
+    /// `##SUBAGENT_REPORT##` section, the report is parsed and shown
+    /// in a concise format by default. Pass `--full` to show the raw
+    /// completion JSON instead.
+    SubagentStatus {
+        session_id: String,
+        output_format: CliOutputFormat,
+        /// Show the full raw completion JSON instead of the parsed report.
+        full: bool,
+    },
+    /// List all active and completed subagents.
+    SubagentList {
         output_format: CliOutputFormat,
     },
     /// Parallel cluster execution: dispatch N concurrent `subagent spawn`
@@ -1358,7 +1949,18 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
             let args: Vec<&str> = rest[1..].iter().map(String::as_str).collect();
             match args.first().copied() {
                 Some("spawn") => {
-                    let msg = args[1..].join(" ");
+                    // Parse optional --raw / --no-summary flag before the message.
+                    let mut spawn_args: Vec<&str> = args[1..].iter().map(|s| s.as_ref()).collect();
+                    let mut no_summary = false;
+                    while let Some(&arg) = spawn_args.first() {
+                        if arg == "--raw" || arg == "--no-summary" {
+                            no_summary = true;
+                            spawn_args.remove(0);
+                        } else {
+                            break;
+                        }
+                    }
+                    let msg = spawn_args.join(" ");
                     if msg.trim().is_empty() {
                         return Err("subagent spawn requires a message".to_string());
                     }
@@ -1372,21 +1974,47 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     } else {
                         model.clone()
                     };
-                    Ok(CliAction::Prompt {
+                    // Generate a unique session id
+                    let session_id = format!(
+                        "sa_{}",
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_nanos()
+                    );
+                    Ok(CliAction::SubagentSpawn {
                         prompt: msg,
                         model: spawn_model,
                         output_format,
-                        allowed_tools,
-                        permission_mode,
-                        compact,
-                        base_commit,
-                        reasoning_effort: reasoning_effort.clone(),
-                        allow_broad_cwd,
+                        session_id,
+                        no_summary,
                     })
                 }
-                Some("list") | None => Err(
-                    "Subagent sessions are managed inside the interactive REPL.\n  Start: claw\n  Then:  /subagent list\n  Or:    /parallel <count> <prompt>".to_string(),
-                ),
+                Some("status") => {
+                    // Parse optional --full flag before the session_id.
+                    let mut status_args: Vec<&str> = args[1..].iter().map(|s| s.as_ref()).collect();
+                    let mut full = false;
+                    while let Some(&arg) = status_args.first() {
+                        if arg == "--full" {
+                            full = true;
+                            status_args.remove(0);
+                        } else {
+                            break;
+                        }
+                    }
+                    let session_id = status_args.join(" ").trim().to_string();
+                    if session_id.is_empty() {
+                        return Err("subagent status requires a session_id".to_string());
+                    }
+                    Ok(CliAction::SubagentStatus {
+                        session_id,
+                        output_format,
+                        full,
+                    })
+                }
+                Some("list") | None => {
+                    Ok(CliAction::SubagentList { output_format })
+                }
                 Some("steer") => Err(
                     "Subagent steering is done inside the interactive REPL.\n  Start: claw\n  Then:  /subagent steer <target> <msg>".to_string(),
                 ),
@@ -1396,7 +2024,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                     output_format,
                 ),
                 Some(other) => Err(format!(
-                    "unknown subagent subcommand: '{other}'. Use 'spawn', 'batch', 'list', or 'steer'."
+                    "unknown subagent subcommand: '{other}'. Use 'spawn', 'status', 'list', 'batch', or 'steer'."
                 )),
             }
         }
