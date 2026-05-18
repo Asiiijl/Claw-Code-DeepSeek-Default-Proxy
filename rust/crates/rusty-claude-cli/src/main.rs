@@ -24,6 +24,8 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(target_os = "windows")]
 const DETACHED_PROCESS: u32 = 0x00000008;
+#[cfg(target_os = "windows")]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -877,7 +879,7 @@ fn handle_subagent_spawn(
 
     #[cfg(target_os = "windows")]
     {
-        cmd.creation_flags(DETACHED_PROCESS);
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
     }
 
     let child = cmd.spawn();
@@ -969,6 +971,63 @@ fn write_subagent_completion(
     // Remove the meta file to indicate completion
     let meta_path = live_dir.join(format!("{session_id}.meta.json"));
     let _ = fs::remove_file(&meta_path);
+
+    // If CLAW_CALLBACK_URL is set, POST the completion notification there.
+    // This allows the calling agent (e.g. Zed) to receive push notifications
+    // instead of polling the notification directory.
+    if let Ok(callback_url) = std::env::var("CLAW_CALLBACK_URL") {
+        if !callback_url.is_empty() {
+            // Build the same payload we wrote to the notification file
+            let payload = serde_json::json!({
+                "session_id": session_id,
+                "status": status,
+                "duration_ms": elapsed.as_millis(),
+                "completed_at_ms": current_timestamp_ms(),
+                "report": report,
+                "error": if stderr.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(stderr.to_string()) },
+            });
+            let body = serde_json::to_string(&payload).unwrap_or_default();
+
+            // Fire-and-forget HTTP POST (non-blocking, best-effort)
+            // Parse callback_url = "http://host:port/path"
+            let callback_url = callback_url.clone();
+            let _ = std::thread::spawn(move || {
+                // Simple URL parsing without external crate:
+                // http://host:port/path -> (host, port, path)
+                let url = callback_url.trim_start_matches("http://");
+                let (host_part, path) = match url.split_once('/') {
+                    Some((h, p)) => (h, format!("/{}", p)),
+                    None => (url, String::from("/")),
+                };
+                let (host, port) = if let Some((h, p)) = host_part.split_once(':') {
+                    (h.to_string(), p.parse::<u16>().unwrap_or(21999))
+                } else {
+                    (host_part.to_string(), 21999u16)
+                };
+
+                if let Ok(mut stream) = std::net::TcpStream::connect(format!("{}:{}", host, port)) {
+                    use std::io::Write;
+                    let request = format!(
+                        "POST {} HTTP/1.1\r\n\
+                         Host: {}:{}\r\n\
+                         Content-Type: application/json\r\n\
+                         Content-Length: {}\r\n\
+                         Connection: close\r\n\
+                         \r\n\
+                         {}",
+                        path,
+                        host,
+                        port,
+                        body.len(),
+                        body
+                    );
+                    let _ = stream.write_all(request.as_bytes());
+                    let _ = stream.flush();
+                }
+            });
+        }
+    }
+
     Ok(())
 }
 
@@ -1193,6 +1252,107 @@ fn handle_subagent_status(
         );
     } else {
         println!("[subagent {session_id}] not found");
+    }
+    Ok(())
+}
+
+/// Handle `claw subagent output <session_id>` — read live output of a running
+/// or completed subagent non-destructively.
+///
+/// For running subagents, reads the `.live_output` file if available.
+/// For completed subagents, reads `.completed.json` (same as `status`).
+/// The key difference from `status`: this DOES NOT delete any files and
+/// DOES NOT trigger notification consumption — it's a read-only peek.
+fn handle_subagent_output(
+    session_id: &str,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let live_dir = subagent_live_dir()?;
+
+    // First check if there's a completed.json (subagent finished)
+    let completed_path = live_dir.join(format!("{session_id}.completed.json"));
+    if let Ok(data) = fs::read_to_string(&completed_path) {
+        let value: serde_json::Value = serde_json::from_str(&data)?;
+        let status = value["status"].as_str().unwrap_or("unknown");
+        let output = value["output"].as_str().unwrap_or("");
+        let error = value["error"].as_str().unwrap_or("");
+        let dur = value["duration_ms"].as_u64().unwrap_or(0);
+
+        if matches!(output_format, CliOutputFormat::Json) {
+            let rep = serde_json::json!({
+                "session_id": session_id,
+                "status": status,
+                "duration_ms": dur,
+                "output": output,
+                "error": if error.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(error.to_string()) },
+            });
+            println!("{}", serde_json::to_string_pretty(&rep)?);
+        } else {
+            println!(
+                "[subagent {}] status={} duration={}ms",
+                session_id, status, dur
+            );
+            if !output.is_empty() {
+                println!("--- output ---");
+                println!("{}", output);
+            }
+            if !error.is_empty() {
+                println!("--- error ---");
+                println!("{}", error);
+            }
+        }
+        return Ok(());
+    }
+
+    // Not completed — try live_output for running subagent
+    let live_path = live_dir.join(format!("{session_id}.live_output"));
+    if let Ok(data) = fs::read_to_string(&live_path) {
+        if matches!(output_format, CliOutputFormat::Json) {
+            let rep = serde_json::json!({
+                "session_id": session_id,
+                "status": "running",
+                "live_output": data,
+            });
+            println!("{}", serde_json::to_string_pretty(&rep)?);
+        } else {
+            println!(
+                "[subagent {}] status=running (live output below)",
+                session_id
+            );
+            println!("--- live output ---");
+            println!("{}", data);
+        }
+        return Ok(());
+    }
+
+    // Just check if it's running but no live output
+    let meta_path = live_dir.join(format!("{session_id}.meta.json"));
+    if let Ok(data) = fs::read_to_string(&meta_path) {
+        let value: serde_json::Value = serde_json::from_str(&data)?;
+        if matches!(output_format, CliOutputFormat::Json) {
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            let started_ms = value["started_at_ms"].as_u64().unwrap_or(0);
+            println!(
+                "[subagent {}] status=running started_at_ms={}",
+                session_id, started_ms
+            );
+            println!("No live output available.");
+        }
+        return Ok(());
+    }
+
+    // Not found
+    if matches!(output_format, CliOutputFormat::Json) {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "type": "subagent_not_found",
+                "session_id": session_id,
+            }))?
+        );
+    } else {
+        println!("[subagent {}] not found", session_id);
     }
     Ok(())
 }
@@ -1596,6 +1756,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             output_format,
             full,
         } => handle_subagent_status(&session_id, output_format, full)?,
+        CliAction::SubagentOutput {
+            session_id,
+            output_format,
+        } => handle_subagent_output(&session_id, output_format)?,
         CliAction::SubagentList { output_format } => handle_subagent_list(output_format)?,
         CliAction::SubagentBatch {
             tasks,
@@ -1756,6 +1920,13 @@ enum CliAction {
         output_format: CliOutputFormat,
         /// Show the full raw completion JSON instead of the parsed report.
         full: bool,
+    },
+    /// Capture live terminal output from a running subagent (non-destructive).
+    /// Reads the subagent's `.live_output` file if available, otherwise returns
+    /// the last known output from `.completed.json`.
+    SubagentOutput {
+        session_id: String,
+        output_format: CliOutputFormat,
     },
     /// List all active and completed subagents.
     SubagentList {
@@ -2216,6 +2387,16 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                         session_id,
                         output_format,
                         full,
+                    })
+                }
+                Some("output") => {
+                    let msg = args[1..].join(" ").trim().to_string();
+                    if msg.is_empty() {
+                        return Err("subagent output requires a session_id".to_string());
+                    }
+                    Ok(CliAction::SubagentOutput {
+                        session_id: msg,
+                        output_format,
                     })
                 }
                 Some("list") | None => {
@@ -5556,7 +5737,13 @@ fn run_repl(
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
-    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode, auto_approve)?;
+    let mut cli = LiveCli::new(
+        resolved_model,
+        true,
+        allowed_tools,
+        permission_mode,
+        auto_approve,
+    )?;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
@@ -6568,11 +6755,17 @@ impl LiveCli {
                     }
                     Some(false) => {
                         self.auto_approve = false;
-                        println!("✅ Auto-approve mode disabled - you will be prompted for tool calls.");
+                        println!(
+                            "✅ Auto-approve mode disabled - you will be prompted for tool calls."
+                        );
                     }
                     None => {
                         self.auto_approve = !self.auto_approve;
-                        let status = if self.auto_approve { "enabled" } else { "disabled" };
+                        let status = if self.auto_approve {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        };
                         println!("✅ Auto-approve mode toggled {status}.");
                     }
                 }
@@ -6605,15 +6798,30 @@ impl LiveCli {
             .collect();
 
         let tool_count = tool_uses.len();
-        let file_ops: Vec<&String> = tool_uses.iter().filter(|t| {
-            matches!(t.as_str(), "read_file" | "write_file" | "edit_file" | "file_edit" | "glob_search" | "grep_search")
-        }).collect();
+        let file_ops: Vec<&String> = tool_uses
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.as_str(),
+                    "read_file"
+                        | "write_file"
+                        | "edit_file"
+                        | "file_edit"
+                        | "glob_search"
+                        | "grep_search"
+                )
+            })
+            .collect();
         let bash_ops: Vec<&String> = tool_uses.iter().filter(|t| t.as_str() == "bash").collect();
-        let web_ops: Vec<&String> = tool_uses.iter().filter(|t| {
-            matches!(t.as_str(), "WebSearch" | "WebFetch")
-        }).collect();
+        let web_ops: Vec<&String> = tool_uses
+            .iter()
+            .filter(|t| matches!(t.as_str(), "WebSearch" | "WebFetch"))
+            .collect();
 
-        let last_text = session.messages.iter().rev()
+        let last_text = session
+            .messages
+            .iter()
+            .rev()
             .filter(|msg| msg.role == runtime::MessageRole::Assistant)
             .flat_map(|msg| msg.blocks.iter())
             .filter_map(|block| match block {
@@ -6632,21 +6840,38 @@ impl LiveCli {
         println!();
         println!("╭─ 📋 Session Summary ");
         println!("│");
-        println!("│  Messages:        {} ({} user, {} assistant)",
+        println!(
+            "│  Messages:        {} ({} user, {} assistant)",
             session.messages.len(),
-            session.messages.iter().filter(|m| m.role == runtime::MessageRole::User).count(),
-            session.messages.iter().filter(|m| m.role == runtime::MessageRole::Assistant).count(),
+            session
+                .messages
+                .iter()
+                .filter(|m| m.role == runtime::MessageRole::User)
+                .count(),
+            session
+                .messages
+                .iter()
+                .filter(|m| m.role == runtime::MessageRole::Assistant)
+                .count(),
         );
         println!("│  Tool calls:      {}", tool_count);
         println!("│    ├─ File ops:   {}", file_ops.len());
         println!("│    ├─ Bash:       {}", bash_ops.len());
         println!("│    └─ Web:        {}", web_ops.len());
-        println!("│  Tokens:          {} in / {} out / {} cache",
+        println!(
+            "│  Tokens:          {} in / {} out / {} cache",
             usage.input_tokens,
             usage.output_tokens,
             usage.cache_read_input_tokens + usage.cache_creation_input_tokens,
         );
-        println!("│  Auto-approve:    {}", if self.auto_approve { "✅ ON" } else { "❌ OFF" });
+        println!(
+            "│  Auto-approve:    {}",
+            if self.auto_approve {
+                "✅ ON"
+            } else {
+                "❌ OFF"
+            }
+        );
         if !summary_text.is_empty() {
             println!("│");
             println!("│  Last response:");
@@ -10470,7 +10695,12 @@ fn print_turn_summary(summary: &runtime::TurnSummary) {
         .iter()
         .flat_map(|msg| msg.blocks.iter())
         .filter_map(|block| match block {
-            runtime::ContentBlock::ToolResult { tool_name, output, is_error, .. } => {
+            runtime::ContentBlock::ToolResult {
+                tool_name,
+                output,
+                is_error,
+                ..
+            } => {
                 let display = if output.len() > 100 {
                     format!("{}...", &output[..100])
                 } else {

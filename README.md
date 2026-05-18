@@ -607,3 +607,6 @@ claw subagent spawn --raw "echo hello"
 MIT — see [`LICENSE`](./LICENSE).
 
 *This repository is not affiliated with, endorsed by, or maintained by Anthropic or DeepSeek.*
+
+<!-- Auto-approve test: modified by subagent at 2026-05-19 -->
+test auto-approve
