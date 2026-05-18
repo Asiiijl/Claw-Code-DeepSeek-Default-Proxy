@@ -1223,7 +1223,7 @@ fn handle_subagent_list(output_format: CliOutputFormat) -> Result<(), Box<dyn st
                 }
             } else {
                 // Still running
-                if let Ok(data) = fs::read_to_string(&entry.path()) {
+                if let Ok(data) = fs::read_to_string(entry.path()) {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
                         entries.push(v);
                     }
@@ -5556,7 +5556,13 @@ fn run_repl(
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
-    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode, auto_approve)?;
+    let mut cli = LiveCli::new(
+        resolved_model,
+        true,
+        allowed_tools,
+        permission_mode,
+        auto_approve,
+    )?;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
@@ -6568,11 +6574,17 @@ impl LiveCli {
                     }
                     Some(false) => {
                         self.auto_approve = false;
-                        println!("✅ Auto-approve mode disabled - you will be prompted for tool calls.");
+                        println!(
+                            "✅ Auto-approve mode disabled - you will be prompted for tool calls."
+                        );
                     }
                     None => {
                         self.auto_approve = !self.auto_approve;
-                        let status = if self.auto_approve { "enabled" } else { "disabled" };
+                        let status = if self.auto_approve {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        };
                         println!("✅ Auto-approve mode toggled {status}.");
                     }
                 }
@@ -6605,15 +6617,30 @@ impl LiveCli {
             .collect();
 
         let tool_count = tool_uses.len();
-        let file_ops: Vec<&String> = tool_uses.iter().filter(|t| {
-            matches!(t.as_str(), "read_file" | "write_file" | "edit_file" | "file_edit" | "glob_search" | "grep_search")
-        }).collect();
+        let file_ops: Vec<&String> = tool_uses
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.as_str(),
+                    "read_file"
+                        | "write_file"
+                        | "edit_file"
+                        | "file_edit"
+                        | "glob_search"
+                        | "grep_search"
+                )
+            })
+            .collect();
         let bash_ops: Vec<&String> = tool_uses.iter().filter(|t| t.as_str() == "bash").collect();
-        let web_ops: Vec<&String> = tool_uses.iter().filter(|t| {
-            matches!(t.as_str(), "WebSearch" | "WebFetch")
-        }).collect();
+        let web_ops: Vec<&String> = tool_uses
+            .iter()
+            .filter(|t| matches!(t.as_str(), "WebSearch" | "WebFetch"))
+            .collect();
 
-        let last_text = session.messages.iter().rev()
+        let last_text = session
+            .messages
+            .iter()
+            .rev()
             .filter(|msg| msg.role == runtime::MessageRole::Assistant)
             .flat_map(|msg| msg.blocks.iter())
             .filter_map(|block| match block {
@@ -6632,21 +6659,38 @@ impl LiveCli {
         println!();
         println!("╭─ 📋 Session Summary ");
         println!("│");
-        println!("│  Messages:        {} ({} user, {} assistant)",
+        println!(
+            "│  Messages:        {} ({} user, {} assistant)",
             session.messages.len(),
-            session.messages.iter().filter(|m| m.role == runtime::MessageRole::User).count(),
-            session.messages.iter().filter(|m| m.role == runtime::MessageRole::Assistant).count(),
+            session
+                .messages
+                .iter()
+                .filter(|m| m.role == runtime::MessageRole::User)
+                .count(),
+            session
+                .messages
+                .iter()
+                .filter(|m| m.role == runtime::MessageRole::Assistant)
+                .count(),
         );
         println!("│  Tool calls:      {}", tool_count);
         println!("│    ├─ File ops:   {}", file_ops.len());
         println!("│    ├─ Bash:       {}", bash_ops.len());
         println!("│    └─ Web:        {}", web_ops.len());
-        println!("│  Tokens:          {} in / {} out / {} cache",
+        println!(
+            "│  Tokens:          {} in / {} out / {} cache",
             usage.input_tokens,
             usage.output_tokens,
             usage.cache_read_input_tokens + usage.cache_creation_input_tokens,
         );
-        println!("│  Auto-approve:    {}", if self.auto_approve { "✅ ON" } else { "❌ OFF" });
+        println!(
+            "│  Auto-approve:    {}",
+            if self.auto_approve {
+                "✅ ON"
+            } else {
+                "❌ OFF"
+            }
+        );
         if !summary_text.is_empty() {
             println!("│");
             println!("│  Last response:");
@@ -10470,7 +10514,12 @@ fn print_turn_summary(summary: &runtime::TurnSummary) {
         .iter()
         .flat_map(|msg| msg.blocks.iter())
         .filter_map(|block| match block {
-            runtime::ContentBlock::ToolResult { tool_name, output, is_error, .. } => {
+            runtime::ContentBlock::ToolResult {
+                tool_name,
+                output,
+                is_error,
+                ..
+            } => {
                 let display = if output.len() > 100 {
                     format!("{}...", &output[..100])
                 } else {
