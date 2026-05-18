@@ -44,7 +44,7 @@
 
 ### Cooperative with Zed Agent
 
-This fork works cooperatively with the [Zed Agent hack fork](https://github.com/CCChisato/Zed-Agent-Auto-Merge-Hack):
+This fork works cooperatively with the [Zed-UnsafeAutoProve](https://github.com/CCChisato/Zed-UnsafeAutoProve/tree/master):
 
 - Both the `claw` CLI and the Zed agent have been modified for **non-blocking subagent** cooperation
 - Subagents dispatched via `claw subagent spawn` or Zed's native `spawn_agent` tool run **in the background** without blocking the caller
