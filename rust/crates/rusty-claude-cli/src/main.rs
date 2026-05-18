@@ -64,7 +64,7 @@ use tools::{
     execute_tool, mvp_tool_specs, GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput,
 };
 
-const DEFAULT_MODEL: &str = "openai/deepseek-chat";
+const DEFAULT_MODEL: &str = "deepseek-chat";
 
 /// #148: Model provenance for `claw status` JSON/text output. Records where
 /// the resolved model string came from so claws don't have to re-read argv
@@ -2786,6 +2786,10 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
         "opus" | "sonnet" | "haiku" => return Ok(()),
         _ => {}
     }
+    // Known bare DeepSeek models are always valid (no provider/ prefix needed).
+    if trimmed.starts_with("deepseek-") || trimmed.starts_with("deepseek/") {
+        return Ok(());
+    }
     // Check for spaces (malformed)
     if trimmed.contains(' ') {
         return Err(format!(
@@ -2813,6 +2817,8 @@ fn validate_model_syntax(model: &str) -> Result<(), String> {
             err_msg.push_str("\nDid you mean `xai/");
             err_msg.push_str(trimmed);
             err_msg.push_str("`? (Requires XAI_API_KEY env var)");
+        } else if trimmed.starts_with("deepseek") {
+            err_msg.push_str("\nDeepSeek models can be used without a provider prefix. Make sure OPENAI_API_KEY and OPENAI_BASE_URL are set.");
         }
         return Err(err_msg);
     }

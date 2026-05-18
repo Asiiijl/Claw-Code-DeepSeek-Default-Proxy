@@ -948,6 +948,11 @@ fn wire_model_for_base_url<'a>(
         return Cow::Borrowed(&model[pos + 1..]);
     }
 
+    // "deepseek/deepseek-chat" → "deepseek-chat" on the wire.
+    if lowered_prefix == "deepseek" {
+        return Cow::Borrowed(&model[pos + 1..]);
+    }
+
     Cow::Borrowed(model)
 }
 

@@ -285,6 +285,17 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_DASHSCOPE_BASE_URL,
         });
     }
+    // DeepSeek models via OpenAI-compatible endpoint.
+    // Routes deepseek/* and bare deepseek-* model names to the
+    // OpenAI-compat client using OPENAI_BASE_URL + OPENAI_API_KEY.
+    if canonical.starts_with("deepseek/") || canonical.starts_with("deepseek-") {
+        return Some(ProviderMetadata {
+            provider: ProviderKind::OpenAi,
+            auth_env: "OPENAI_API_KEY",
+            base_url_env: "OPENAI_BASE_URL",
+            default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
+        });
+    }
     None
 }
 
@@ -1377,7 +1388,7 @@ ANTHROPIC_API_KEY=plain-value
 XAI_API_KEY=\"quoted-value\"
 OPENAI_API_KEY='single-quoted'
 export GROK_API_KEY=exported-value
-   PADDED_KEY  =  padded-value  
+   PADDED_KEY  =  padded-value
 EMPTY_VALUE=
 NO_EQUALS_LINE
 ";

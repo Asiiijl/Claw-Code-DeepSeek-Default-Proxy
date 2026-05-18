@@ -13,6 +13,8 @@ status-help.txt
 # Diagnostic tool (not part of the project)
 rust/diag_ddg/
 nul
+# Local sandbox artifacts (not part of the project)
+.sandbox-home/
 # Legacy Python port session scratch artifacts
 .port_sessions/
 
