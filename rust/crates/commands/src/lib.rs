@@ -419,6 +419,13 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
         resume_supported: true,
     },
     SlashCommandSpec {
+        name: "auto-approve",
+        aliases: &["aa"],
+        summary: "Toggle automatic approval of tool calls (on/off)",
+        argument_hint: Some("[on|off]"),
+        resume_supported: true,
+    },
+    SlashCommandSpec {
         name: "desktop",
         aliases: &[],
         summary: "Open or manage the desktop app integration",
@@ -1112,6 +1119,9 @@ pub enum SlashCommand {
     Fast,
     Exit,
     Summary,
+    AutoApprove {
+        enabled: Option<bool>,
+    },
     Desktop,
     Brief,
     Advisor,
@@ -1429,6 +1439,24 @@ pub fn validate_slash_command_input(
         "summary" => {
             validate_no_args(command, &args)?;
             SlashCommand::Summary
+        }
+        "auto-approve" => {
+            let enabled = if args.is_empty() {
+                None
+            } else if args.len() == 1 {
+                match args[0].to_ascii_lowercase().as_str() {
+                    "on" | "true" | "yes" | "1" => Some(true),
+                    "off" | "false" | "no" | "0" => Some(false),
+                    _ => return Err(SlashCommandParseError::new(
+                        format!("invalid argument '{}' for /auto-approve. Use 'on' or 'off'", args[0])
+                    )),
+                }
+            } else {
+                return Err(SlashCommandParseError::new(
+                    "too many arguments for /auto-approve. Use 'on' or 'off'".to_string()
+                ));
+            };
+            SlashCommand::AutoApprove { enabled }
         }
         "desktop" => {
             validate_no_args(command, &args)?;
@@ -4283,6 +4311,7 @@ pub fn handle_slash_command(
         | SlashCommand::Fast
         | SlashCommand::Exit
         | SlashCommand::Summary
+        | SlashCommand::AutoApprove { .. }
         | SlashCommand::Desktop
         | SlashCommand::Brief
         | SlashCommand::Advisor
