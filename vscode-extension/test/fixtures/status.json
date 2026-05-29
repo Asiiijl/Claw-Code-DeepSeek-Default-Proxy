@@ -1,0 +1,8 @@
+{
+  "kind": "status",
+  "status": "ok",
+  "model": "openai/deepseek-chat",
+  "provider": "OpenAI-compatible",
+  "config_load_error": null
+}
+

@@ -1,0 +1,12 @@
+{
+  "subagents": [
+    {
+      "session_id": "sa_1",
+      "status": "running",
+      "model": "openai/deepseek-chat",
+      "prompt": "inspect workspace health"
+    }
+  ],
+  "count": 1
+}
+

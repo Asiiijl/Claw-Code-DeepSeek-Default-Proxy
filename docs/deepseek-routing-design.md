@@ -2,8 +2,8 @@
 
 ## 目录
 
-1. [现状：已经修复了，不再需要 `openai/` 前缀](#1-现状)
-2. [完整链路追踪：从 `claw prompt "hello"` 到 DeepSeek API](#2-完整链路追踪)
+1. [现状：已经修复了，不再需要 `openai/` 前缀](#1-现状已经修复了不再需要-openai-前缀)
+2. [完整链路追踪：从 `claw prompt "hello"` 到 DeepSeek API](#2-完整链路追踪从-claw-prompt-hello-到-deepseek-api)
 3. [关键代码文件与结构体映射](#3-关键代码文件与结构体映射)
 4. [DeepSeek 路由修复详解](#4-deepseek-路由修复详解)
 5. [怎么读这个代码库](#5-怎么读这个代码库)

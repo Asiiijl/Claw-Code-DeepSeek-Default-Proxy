@@ -1011,6 +1011,7 @@ struct AnthropicErrorBody {
 #[cfg(test)]
 mod tests {
     use super::{ALT_REQUEST_ID_HEADER, REQUEST_ID_HEADER};
+    use std::ffi::OsString;
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::{Mutex, OnceLock};
@@ -1030,6 +1031,28 @@ mod tests {
         LOCK.get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
     }
 
     fn temp_config_home() -> std::path::PathBuf {
@@ -1194,6 +1217,8 @@ mod tests {
     #[test]
     fn resolve_saved_oauth_token_refreshes_expired_credentials() {
         let _guard = env_lock();
+        let _no_proxy = EnvVarGuard::set("NO_PROXY", "localhost,127.0.0.1");
+        let _lower_no_proxy = EnvVarGuard::set("no_proxy", "localhost,127.0.0.1");
         let config_home = temp_config_home();
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");
@@ -1250,6 +1275,8 @@ mod tests {
     #[test]
     fn resolve_saved_oauth_token_preserves_refresh_token_when_refresh_response_omits_it() {
         let _guard = env_lock();
+        let _no_proxy = EnvVarGuard::set("NO_PROXY", "localhost,127.0.0.1");
+        let _lower_no_proxy = EnvVarGuard::set("no_proxy", "localhost,127.0.0.1");
         let config_home = temp_config_home();
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
         std::env::remove_var("ANTHROPIC_AUTH_TOKEN");

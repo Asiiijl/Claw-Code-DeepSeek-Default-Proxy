@@ -1447,13 +1447,16 @@ pub fn validate_slash_command_input(
                 match args[0].to_ascii_lowercase().as_str() {
                     "on" | "true" | "yes" | "1" => Some(true),
                     "off" | "false" | "no" | "0" => Some(false),
-                    _ => return Err(SlashCommandParseError::new(
-                        format!("invalid argument '{}' for /auto-approve. Use 'on' or 'off'", args[0])
-                    )),
+                    _ => {
+                        return Err(SlashCommandParseError::new(format!(
+                            "invalid argument '{}' for /auto-approve. Use 'on' or 'off'",
+                            args[0]
+                        )))
+                    }
                 }
             } else {
                 return Err(SlashCommandParseError::new(
-                    "too many arguments for /auto-approve. Use 'on' or 'off'".to_string()
+                    "too many arguments for /auto-approve. Use 'on' or 'off'".to_string(),
                 ));
             };
             SlashCommand::AutoApprove { enabled }
@@ -4943,7 +4946,7 @@ mod tests {
         assert!(help.contains("aliases: /skill"));
         assert!(!help.contains("/login"));
         assert!(!help.contains("/logout"));
-        assert_eq!(slash_command_specs().len(), 139);
+        assert_eq!(slash_command_specs().len(), 140);
         assert!(resume_supported_slash_commands().len() >= 39);
     }
 

@@ -33,6 +33,20 @@ cargo build --workspace
 .\target\debug\claw.exe --help
 ```
 
+## Workspace hygiene
+
+- Keep API keys and live tokens out of the repository. Use shell environment
+  variables or machine-local settings for `OPENAI_API_KEY`,
+  `ANTHROPIC_API_KEY`, and provider credentials.
+- `.claw.json` may contain copy/paste-safe proxy defaults, but it must not
+  contain secrets. Prefer local shell profiles for personal credentials.
+- `.claude.json` currently records dogfood-oriented defaults for this fork; do
+  not treat permissive local approval settings as the recommended default for
+  new users.
+- Do not commit generated sessions, transcripts, build outputs, or scratch
+  porting state. `.claw/sessions/`, `.claude/sessions/`, `.port_sessions/`, and
+  `rust/target/` are local artifacts.
+
 ## Checks before opening a pull request
 
 Run the smallest relevant tests for your change, then the broader checks when

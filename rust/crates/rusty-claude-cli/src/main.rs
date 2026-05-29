@@ -1223,7 +1223,7 @@ fn handle_subagent_list(output_format: CliOutputFormat) -> Result<(), Box<dyn st
                 }
             } else {
                 // Still running
-                if let Ok(data) = fs::read_to_string(&entry.path()) {
+                if let Ok(data) = fs::read_to_string(entry.path()) {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
                         entries.push(v);
                     }
@@ -1269,6 +1269,85 @@ fn handle_subagent_list(output_format: CliOutputFormat) -> Result<(), Box<dyn st
         }
     }
     Ok(())
+}
+
+fn handle_session_cli(
+    action: Option<&str>,
+    target: Option<&str>,
+    output_format: CliOutputFormat,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match action.unwrap_or("list") {
+        "list" => {
+            let sessions = list_managed_sessions()?;
+            if matches!(output_format, CliOutputFormat::Json) {
+                let items: Vec<serde_json::Value> =
+                    sessions.iter().map(session_summary_json_value).collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "kind": "session_list",
+                        "status": "ok",
+                        "count": items.len(),
+                        "sessions": items,
+                    }))?
+                );
+            } else {
+                let active = latest_managed_session()
+                    .ok()
+                    .map(|session| session.id)
+                    .unwrap_or_else(|| "latest".to_string());
+                println!("{}", render_session_list(&active)?);
+            }
+            Ok(())
+        }
+        "show" => {
+            let reference = target
+                .ok_or_else(|| "session show requires a session id or `latest`".to_string())?;
+            let session = if reference == "latest" {
+                latest_managed_session()?
+            } else {
+                list_managed_sessions()?
+                    .into_iter()
+                    .find(|session| session.id == reference)
+                    .ok_or_else(|| format!("session not found: {reference}"))?
+            };
+            if matches!(output_format, CliOutputFormat::Json) {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "kind": "session_show",
+                        "status": "ok",
+                        "session": session_summary_json_value(&session),
+                    }))?
+                );
+            } else {
+                println!("Session");
+                println!("  Id               {}", session.id);
+                println!("  Path             {}", session.path.display());
+                println!("  Messages         {}", session.message_count);
+                println!("  Updated at ms    {}", session.updated_at_ms);
+                println!("  Lifecycle        {}", session.lifecycle.signal());
+            }
+            Ok(())
+        }
+        other => Err(format!(
+            "unknown session subcommand: '{other}'. Use 'list' or 'show <id|latest>'."
+        )
+        .into()),
+    }
+}
+
+fn session_summary_json_value(session: &ManagedSessionSummary) -> serde_json::Value {
+    serde_json::json!({
+        "id": session.id.as_str(),
+        "path": session.path.display().to_string(),
+        "updated_at_ms": session.updated_at_ms,
+        "modified_epoch_millis": session.modified_epoch_millis.to_string(),
+        "message_count": session.message_count,
+        "parent_session_id": session.parent_session_id.as_deref(),
+        "branch_name": session.branch_name.as_deref(),
+        "lifecycle": session.lifecycle.json_value(),
+    })
 }
 
 /// Return the current Unix epoch time in milliseconds.
@@ -1597,6 +1676,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             full,
         } => handle_subagent_status(&session_id, output_format, full)?,
         CliAction::SubagentList { output_format } => handle_subagent_list(output_format)?,
+        CliAction::Session {
+            action,
+            target,
+            output_format,
+        } => handle_session_cli(action.as_deref(), target.as_deref(), output_format)?,
         CliAction::SubagentBatch {
             tasks,
             parallel,
@@ -1759,6 +1843,12 @@ enum CliAction {
     },
     /// List all active and completed subagents.
     SubagentList {
+        output_format: CliOutputFormat,
+    },
+    /// Direct local session inspection for automation and editor integrations.
+    Session {
+        action: Option<String>,
+        target: Option<String>,
         output_format: CliOutputFormat,
     },
     /// Parallel cluster execution: dispatch N concurrent `subagent spawn`
@@ -2234,6 +2324,23 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
                 )),
             }
         }
+        "session" => {
+            let tail = &rest[1..];
+            let action = tail.first().cloned();
+            let target = tail.get(1).cloned();
+            if tail.len() > 2 {
+                return Err(format!(
+                    "unexpected extra arguments after `claw session {}`: {}",
+                    tail[..2].join(" "),
+                    tail[2..].join(" ")
+                ));
+            }
+            Ok(CliAction::Session {
+                action,
+                target,
+                output_format,
+            })
+        }
         // `claw permissions <mode>` falls through to the LLM when called
         // with a subcommand argument because parse_single_word_command_alias
         // only intercepts the bare single-word form. Catch all multi-word
@@ -2431,11 +2538,12 @@ fn parse_single_word_command_alias(
         "sandbox" => Some(Ok(CliAction::Sandbox { output_format })),
         "doctor" => Some(Ok(CliAction::Doctor { output_format })),
         "state" => Some(Ok(CliAction::State { output_format })),
-        // #146: let `config` and `diff` fall through to parse_subcommand
+        // #146/#VSCode: let direct local inspection commands fall through
+        // to parse_subcommand instead of producing slash-command guidance.
         // where they are wired as pure-local introspection, instead of
         // producing the "is a slash command" guidance. Zero-arg cases
         // reach parse_subcommand too via this None.
-        "config" | "diff" => None,
+        "config" | "diff" | "session" => None,
         other => bare_slash_command_guidance(other).map(Err),
     }
 }
@@ -5556,7 +5664,13 @@ fn run_repl(
     enforce_broad_cwd_policy(allow_broad_cwd, CliOutputFormat::Text)?;
     run_stale_base_preflight(base_commit.as_deref());
     let resolved_model = resolve_repl_model(model);
-    let mut cli = LiveCli::new(resolved_model, true, allowed_tools, permission_mode, auto_approve)?;
+    let mut cli = LiveCli::new(
+        resolved_model,
+        true,
+        allowed_tools,
+        permission_mode,
+        auto_approve,
+    )?;
     cli.set_reasoning_effort(reasoning_effort);
     let mut editor =
         input::LineEditor::new("> ", cli.repl_completion_candidates().unwrap_or_default());
@@ -6568,11 +6682,17 @@ impl LiveCli {
                     }
                     Some(false) => {
                         self.auto_approve = false;
-                        println!("✅ Auto-approve mode disabled - you will be prompted for tool calls.");
+                        println!(
+                            "✅ Auto-approve mode disabled - you will be prompted for tool calls."
+                        );
                     }
                     None => {
                         self.auto_approve = !self.auto_approve;
-                        let status = if self.auto_approve { "enabled" } else { "disabled" };
+                        let status = if self.auto_approve {
+                            "enabled"
+                        } else {
+                            "disabled"
+                        };
                         println!("✅ Auto-approve mode toggled {status}.");
                     }
                 }
@@ -6605,15 +6725,30 @@ impl LiveCli {
             .collect();
 
         let tool_count = tool_uses.len();
-        let file_ops: Vec<&String> = tool_uses.iter().filter(|t| {
-            matches!(t.as_str(), "read_file" | "write_file" | "edit_file" | "file_edit" | "glob_search" | "grep_search")
-        }).collect();
+        let file_ops: Vec<&String> = tool_uses
+            .iter()
+            .filter(|t| {
+                matches!(
+                    t.as_str(),
+                    "read_file"
+                        | "write_file"
+                        | "edit_file"
+                        | "file_edit"
+                        | "glob_search"
+                        | "grep_search"
+                )
+            })
+            .collect();
         let bash_ops: Vec<&String> = tool_uses.iter().filter(|t| t.as_str() == "bash").collect();
-        let web_ops: Vec<&String> = tool_uses.iter().filter(|t| {
-            matches!(t.as_str(), "WebSearch" | "WebFetch")
-        }).collect();
+        let web_ops: Vec<&String> = tool_uses
+            .iter()
+            .filter(|t| matches!(t.as_str(), "WebSearch" | "WebFetch"))
+            .collect();
 
-        let last_text = session.messages.iter().rev()
+        let last_text = session
+            .messages
+            .iter()
+            .rev()
             .filter(|msg| msg.role == runtime::MessageRole::Assistant)
             .flat_map(|msg| msg.blocks.iter())
             .filter_map(|block| match block {
@@ -6632,21 +6767,38 @@ impl LiveCli {
         println!();
         println!("╭─ 📋 Session Summary ");
         println!("│");
-        println!("│  Messages:        {} ({} user, {} assistant)",
+        println!(
+            "│  Messages:        {} ({} user, {} assistant)",
             session.messages.len(),
-            session.messages.iter().filter(|m| m.role == runtime::MessageRole::User).count(),
-            session.messages.iter().filter(|m| m.role == runtime::MessageRole::Assistant).count(),
+            session
+                .messages
+                .iter()
+                .filter(|m| m.role == runtime::MessageRole::User)
+                .count(),
+            session
+                .messages
+                .iter()
+                .filter(|m| m.role == runtime::MessageRole::Assistant)
+                .count(),
         );
         println!("│  Tool calls:      {}", tool_count);
         println!("│    ├─ File ops:   {}", file_ops.len());
         println!("│    ├─ Bash:       {}", bash_ops.len());
         println!("│    └─ Web:        {}", web_ops.len());
-        println!("│  Tokens:          {} in / {} out / {} cache",
+        println!(
+            "│  Tokens:          {} in / {} out / {} cache",
             usage.input_tokens,
             usage.output_tokens,
             usage.cache_read_input_tokens + usage.cache_creation_input_tokens,
         );
-        println!("│  Auto-approve:    {}", if self.auto_approve { "✅ ON" } else { "❌ OFF" });
+        println!(
+            "│  Auto-approve:    {}",
+            if self.auto_approve {
+                "✅ ON"
+            } else {
+                "❌ OFF"
+            }
+        );
         if !summary_text.is_empty() {
             println!("│");
             println!("│  Last response:");
@@ -10470,7 +10622,12 @@ fn print_turn_summary(summary: &runtime::TurnSummary) {
         .iter()
         .flat_map(|msg| msg.blocks.iter())
         .filter_map(|block| match block {
-            runtime::ContentBlock::ToolResult { tool_name, output, is_error, .. } => {
+            runtime::ContentBlock::ToolResult {
+                tool_name,
+                output,
+                is_error,
+                ..
+            } => {
                 let display = if output.len() > 100 {
                     format!("{}...", &output[..100])
                 } else {
@@ -12035,6 +12192,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                auto_approve: false,
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
@@ -12413,6 +12571,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::ReadOnly,
+                auto_approve: false,
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
@@ -12434,6 +12593,7 @@ mod tests {
                 model: DEFAULT_MODEL.to_string(),
                 allowed_tools: None,
                 permission_mode: PermissionMode::DangerFullAccess,
+                auto_approve: false,
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
@@ -12491,6 +12651,7 @@ mod tests {
                         .collect()
                 ),
                 permission_mode: PermissionMode::DangerFullAccess,
+                auto_approve: false,
                 base_commit: None,
                 reasoning_effort: None,
                 allow_broad_cwd: false,
@@ -12773,6 +12934,41 @@ mod tests {
             .expect("diff --output-format json should parse"),
             CliAction::Diff {
                 output_format: CliOutputFormat::Json,
+            }
+        );
+        assert_eq!(
+            parse_args(&["session".to_string()]).expect("session should parse"),
+            CliAction::Session {
+                action: None,
+                target: None,
+                output_format: CliOutputFormat::Text,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "session".to_string(),
+                "list".to_string(),
+                "--output-format".to_string(),
+                "json".to_string(),
+            ])
+            .expect("session list --output-format json should parse"),
+            CliAction::Session {
+                action: Some("list".to_string()),
+                target: None,
+                output_format: CliOutputFormat::Json,
+            }
+        );
+        assert_eq!(
+            parse_args(&[
+                "session".to_string(),
+                "show".to_string(),
+                "latest".to_string(),
+            ])
+            .expect("session show latest should parse"),
+            CliAction::Session {
+                action: Some("show".to_string()),
+                target: Some("latest".to_string()),
+                output_format: CliOutputFormat::Text,
             }
         );
         // #147: empty / whitespace-only positional args must be rejected

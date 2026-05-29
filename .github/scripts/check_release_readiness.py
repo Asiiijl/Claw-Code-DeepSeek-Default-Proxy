@@ -63,10 +63,10 @@ def github_anchor(heading: str) -> str:
     anchor = heading.strip().lower()
     anchor = re.sub(r"<[^>]+>", "", anchor)
     anchor = re.sub(r"`([^`]*)`", r"\1", anchor)
-    anchor = re.sub(r"[^a-z0-9 _-]", "", anchor)
-    anchor = anchor.replace(" ", "-")
+    anchor = re.sub(r"[^\w\s-]", "", anchor, flags=re.UNICODE)
+    anchor = re.sub(r"\s+", "-", anchor)
     anchor = re.sub(r"-+", "-", anchor)
-    return anchor.strip("-")
+    return anchor.strip()
 
 
 def anchors_for(path: Path) -> set[str]:
@@ -74,7 +74,10 @@ def anchors_for(path: Path) -> set[str]:
     for line in path.read_text(encoding="utf-8").splitlines():
         match = re.match(r"^(#{1,6})\s+(.+?)\s*#*\s*$", line)
         if match:
-            anchors.add(github_anchor(match.group(2)))
+            anchor = github_anchor(match.group(2))
+            anchors.add(anchor)
+            if anchor.startswith("-"):
+                anchors.add(anchor.lstrip("-"))
     return anchors
 
 

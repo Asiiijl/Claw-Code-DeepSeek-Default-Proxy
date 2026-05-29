@@ -783,6 +783,8 @@ async fn spawn_server(
     state: Arc<Mutex<Vec<CapturedRequest>>>,
     responses: Vec<String>,
 ) -> TestServer {
+    std::env::set_var("NO_PROXY", "localhost,127.0.0.1");
+    std::env::set_var("no_proxy", "localhost,127.0.0.1");
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("listener should bind");

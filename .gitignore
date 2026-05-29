@@ -10,6 +10,11 @@ archive/
 .claw/sessions/
 .clawhip/
 status-help.txt
+rust/target/
+rust/.claw/
+vscode-extension/node_modules/
+vscode-extension/out/
+vscode-extension/*.vsix
 # Diagnostic tool (not part of the project)
 rust/diag_ddg/
 nul

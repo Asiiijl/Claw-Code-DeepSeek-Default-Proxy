@@ -1,0 +1,152 @@
+{
+  "name": "claw-code-vscode",
+  "displayName": "Claw Code",
+  "description": "VS Code control surface for the local Claw Code CLI and DeepSeek-first fork.",
+  "version": "0.1.0",
+  "publisher": "asiiijl",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Asiiijl/Claw-Code-DeepSeek-Default-Proxy.git",
+    "directory": "vscode-extension"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onCommand:claw.prompt",
+    "onCommand:claw.openReplTerminal",
+    "onCommand:claw.status",
+    "onCommand:claw.doctor",
+    "onCommand:claw.configureDeepSeek",
+    "onCommand:claw.spawnSubagent",
+    "onCommand:claw.showSubagentNotifications",
+    "onView:claw.providerStatus",
+    "onView:claw.sessions",
+    "onView:claw.subagents"
+  ],
+  "main": "./out/src/extension.js",
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "test": "npm run compile && node ./out/test/runTests.js",
+    "package": "npm run compile && npx @vscode/vsce package"
+  },
+  "contributes": {
+    "commands": [
+      {
+        "command": "claw.prompt",
+        "title": "Claw: Prompt"
+      },
+      {
+        "command": "claw.openReplTerminal",
+        "title": "Claw: Open REPL Terminal"
+      },
+      {
+        "command": "claw.status",
+        "title": "Claw: Status"
+      },
+      {
+        "command": "claw.doctor",
+        "title": "Claw: Doctor"
+      },
+      {
+        "command": "claw.configureDeepSeek",
+        "title": "Claw: Configure DeepSeek"
+      },
+      {
+        "command": "claw.spawnSubagent",
+        "title": "Claw: Spawn Subagent"
+      },
+      {
+        "command": "claw.showSubagentNotifications",
+        "title": "Claw: Show Subagent Notifications"
+      },
+      {
+        "command": "claw.refreshViews",
+        "title": "Claw: Refresh Views"
+      }
+    ],
+    "configuration": {
+      "title": "Claw Code",
+      "properties": {
+        "claw.path": {
+          "type": "string",
+          "default": "",
+          "description": "Explicit path to the claw CLI binary. Leave empty to use workspace rust/target/release/claw or PATH."
+        },
+        "claw.defaultModel": {
+          "type": "string",
+          "default": "openai/deepseek-chat",
+          "description": "Default model passed to prompt and subagent commands."
+        },
+        "claw.openaiBaseUrl": {
+          "type": "string",
+          "default": "https://api.deepseek.com/v1",
+          "description": "OpenAI-compatible base URL. For DeepSeek use https://api.deepseek.com/v1."
+        },
+        "claw.envFile": {
+          "type": "string",
+          "default": "",
+          "description": "Optional machine-local env file to load before invoking claw. Do not commit files that contain secrets."
+        },
+        "claw.useIntegratedTerminal": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run prompt, REPL, and subagent flows in the VS Code integrated terminal."
+        },
+        "claw.outputFormat": {
+          "type": "string",
+          "enum": [
+            "json"
+          ],
+          "default": "json",
+          "description": "Machine-readable output format consumed by the extension."
+        }
+      }
+    },
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "claw",
+          "title": "Claw",
+          "icon": "resources/claw.svg"
+        }
+      ]
+    },
+    "views": {
+      "claw": [
+        {
+          "id": "claw.providerStatus",
+          "name": "Provider"
+        },
+        {
+          "id": "claw.sessions",
+          "name": "Sessions"
+        },
+        {
+          "id": "claw.subagents",
+          "name": "Subagents"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "claw.refreshViews",
+          "when": "view == claw.providerStatus || view == claw.sessions || view == claw.subagents",
+          "group": "navigation"
+        }
+      ]
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.30",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^2.15.0",
+    "typescript": "^5.4.5"
+  }
+}

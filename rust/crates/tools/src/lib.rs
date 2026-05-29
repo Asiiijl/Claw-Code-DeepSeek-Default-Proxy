@@ -10208,6 +10208,8 @@ printf 'pwsh:%s' "$1"
 
     impl TestServer {
         fn spawn(handler: Arc<dyn Fn(&str) -> HttpResponse + Send + Sync + 'static>) -> Self {
+            std::env::set_var("NO_PROXY", "localhost,127.0.0.1");
+            std::env::set_var("no_proxy", "localhost,127.0.0.1");
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
             listener
                 .set_nonblocking(true)

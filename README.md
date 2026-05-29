@@ -1,7 +1,7 @@
 # Claw Code — DeepSeek Subagent Fork
 
 <p align="center">
-  <img src="./assets/ClawCode_Banner_V0.1.2-1.gif" alt="ClawCode Banner" width="100%" />
+  <img src="./assets/claw-hero.jpeg" alt="ClawCode Banner" width="100%" />
 </p>
 
 <p align="center">
@@ -596,6 +596,9 @@ claw subagent spawn --raw "echo hello"
 - [`docs/navigation-file-context.md`](./docs/navigation-file-context.md) — terminal navigation, scrollback, `@path` file context
 - [`docs/local-openai-compatible-providers.md`](./docs/local-openai-compatible-providers.md) — Ollama/llama.cpp/vLLM, OpenRouter, local skills
 - [`docs/windows-install-release.md`](./docs/windows-install-release.md) — Windows release install, provider switching, notification smoke paths
+- [`docs/upstream-sync.md`](./docs/upstream-sync.md) — upstream merge workflow and fork-delta guardrails
+- [`docs/fork-delta.md`](./docs/fork-delta.md) — DeepSeek fork invariants that must survive upstream syncs
+- [`docs/vscode-extension.md`](./docs/vscode-extension.md) — VS Code extension architecture and local development flow
 - [`PARITY.md`](./PARITY.md) — Rust-port parity status and migration notes
 - [`ROADMAP.md`](./ROADMAP.md) — active roadmap and cleanup backlog
 - [`CONTRIBUTING.md`](./CONTRIBUTING.md), [`SECURITY.md`](./SECURITY.md), [`SUPPORT.md`](./SUPPORT.md), [`CODE_OF_CONDUCT.md`](./CODE_OF_CONDUCT.md)

@@ -1,0 +1,12 @@
+{
+  "kind": "doctor",
+  "status": "ok",
+  "checks": [
+    {
+      "name": "provider_env",
+      "status": "ok",
+      "message": "OPENAI_BASE_URL is configured"
+    }
+  ]
+}
+
